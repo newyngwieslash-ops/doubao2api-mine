@@ -184,3 +184,57 @@ def test_acquire_returns_none_when_context_dead():
     from doubao2api.account_manager import Account
     acc = Account(id="a1", name="acc1", cookies={"sessionid": "s1"})
     assert asyncio.run(bc.acquire_service_page(acc)) is None
+
+
+def test_chat_completion_rebinds_page_after_restart():
+    """Regression: chat_completion must re-read self._page after the default-page
+    self-heal restart, so a fresh default page reaches _sign_url/_browser_fetch_stream.
+
+    Pre-pool behavior bound the default page at call time and recovered
+    transparently; binding `pg` before the restart block passed the stale dead
+    page to the signer (sign fails 3x -> RuntimeError). An explicit `page`
+    must stay untouched by the heal.
+    """
+    bc = _bc()
+
+    dead_page = MagicMock()
+    dead_page.is_closed = lambda: True
+    fresh_page = MagicMock()
+    fresh_page.is_closed = lambda: False
+    fresh_page.evaluate = AsyncMock(return_value={"a_bogus": "fresh"})
+
+    bc._page = dead_page
+    captured = {}
+
+    async def fake_restart():
+        bc._page = fresh_page
+
+    async def fake_sign_url(path, params, page=None):
+        captured["page"] = page
+        return "http://signed"
+
+    bc.is_alive = AsyncMock(return_value=False)
+    bc.restart = AsyncMock(side_effect=fake_restart)
+    bc._sign_url = AsyncMock(side_effect=fake_sign_url)
+    bc._browser_fetch_stream = AsyncMock()
+
+    async def scenario():
+        gen = bc.chat_completion("hi")
+        try:
+            # Generator suspends on the 180s queue wait; 0.5s in, _sign_url has
+            # already been awaited with whichever page `pg` resolved to.
+            await asyncio.wait_for(gen.__anext__(), timeout=0.5)
+        except TimeoutError:
+            pass
+        finally:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+        return captured.get("page")
+
+    page_used = asyncio.run(scenario())
+    assert page_used is fresh_page, (
+        "chat_completion signed with a stale dead page instead of the "
+        "post-restart default page"
+    )

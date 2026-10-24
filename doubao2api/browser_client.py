@@ -1252,10 +1252,12 @@ class BrowserClient:
         """Send a chat message and yield SSE events via in-browser fetch."""
         # 穿透：显式 page 用该页执行签名与 fetch；缺省回退默认页，行为不变。
         # 自愈（liveness check / restart）只属默认页；服务页死亡由池重建处理。
-        pg = page or self._page
+        # 注意：pg 必须在自愈块之后绑定，restart() 换上新默认页后重读 self._page，
+        # 恢复旧版（池化前）透明自愈行为；显式传入的 page 不受影响。
         if not self._page or self._page.is_closed() or not await self.is_alive():
             log.warning("Browser page is closed or not alive. Auto-recovering browser now...")
             await self.restart()
+        pg = page or self._page
 
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
