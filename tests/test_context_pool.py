@@ -269,6 +269,123 @@ def test_try_auto_solve_retries_once(monkeypatch):
     assert calls["n"] == 2          # tried twice, not once, not forever
 
 
+def test_routing_sticky_by_conversation_and_falls_back(monkeypatch):
+    import doubao2api.unified_server as us
+    from doubao2api.account_manager import Account, AccountManager
+
+    # filepath=":" makes load() a no-op (path never exists); accounts are set
+    # by hand and save() must never be triggered — ":" is unwritable.
+    am = AccountManager(filepath=":")
+    acc1 = Account(id="a1", name="1", cookies={"sessionid": "s"})
+    acc2 = Account(id="a2", name="2", cookies={"sessionid": "s"})
+    am.accounts = {"a1": acc1, "a2": acc2}
+    am.active_account_id = "a1"
+
+    client = MagicMock()
+    client.account_manager = am
+
+    # default env (no DOUBAO_POOL_SIZE) -> routing disabled -> None
+    monkeypatch.delenv("DOUBAO_POOL_SIZE", raising=False)
+    assert us._route_account(client, None) is None
+
+    monkeypatch.setenv("DOUBAO_POOL_SIZE", "1")
+    assert us._route_account(client, None) is None        # pool off -> no-op
+
+    monkeypatch.setenv("DOUBAO_POOL_SIZE", "2")
+    assert us._route_account(client, "c_new") is not None  # new conv -> any account
+    assert us._route_account(client, "c_new").id in ("a1", "a2")
+
+    # sticky: existing conversation owned by a2 returns a2 even if a1 active
+    us._conv_owner["c_sticky"] = "a2"
+    assert us._route_account(client, "c_sticky").id == "a2"
+
+    # owner flagged captcha -> falls through to next available
+    acc2.status = "captcha"   # bypass mark_captcha_required's save()
+    routed = us._route_account(client, "c_sticky")
+    assert routed is None or routed.id != "a2"
+
+
+def test_chat_endpoint_routes_to_account_page(monkeypatch):
+    from doubao2api.account_manager import Account, AccountManager
+    from doubao2api.unified_server import create_app
+    from fastapi.testclient import TestClient
+
+    am = AccountManager(filepath=":")
+    acc1 = Account(id="a1", name="1", cookies={"sessionid": "s"})
+    am.accounts = {"a1": acc1}
+    am.active_account_id = "a1"
+    monkeypatch.setenv("DOUBAO_POOL_SIZE", "2")
+
+    from tests.test_fatal_regressions import _mock_client
+    m = _mock_client()
+    m.account_manager = am
+    svc_page = MagicMock()
+    m.acquire_service_page = AsyncMock(return_value=svc_page)
+
+    async def fake_chat(*args, **kwargs):
+        assert kwargs.get("page") is svc_page
+        yield {"_event": "CHUNK_DELTA", "text": "ok"}
+
+    m.chat_completion = fake_chat
+
+    tc = TestClient(create_app(browser_client=m))
+    resp = tc.post("/v1/chat/completions", json={
+        "model": "doubao-2.1-turbo", "stream": False,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert resp.status_code == 200, resp.text
+    m.acquire_service_page.assert_awaited_once()
+
+
+def test_chat_completion_skips_default_page_restart_for_explicit_page():
+    """C1: with an explicit (pool) page, chat_completion must NOT run the
+    default-page liveness check / restart — restart() stops the whole browser
+    and would destroy the caller's pool page. Pool-page death is handled by
+    the pool (acquire recreates; a dead page mid-request fails the request)."""
+    bc = _bc()
+
+    dead_page = MagicMock()
+    dead_page.is_closed = lambda: True
+    explicit_page = MagicMock()
+    explicit_page.is_closed = lambda: False
+
+    bc._page = dead_page
+    captured = {}
+
+    async def boom_restart():
+        raise AssertionError("restart() must not be called for explicit page")
+
+    async def fake_sign_url(path, params, page=None):
+        captured["page"] = page
+        return "http://signed"
+
+    bc.is_alive = AsyncMock(return_value=False)
+    bc.restart = AsyncMock(side_effect=boom_restart)
+    bc._sign_url = AsyncMock(side_effect=fake_sign_url)
+    bc._browser_fetch_stream = AsyncMock()
+
+    async def scenario():
+        gen = bc.chat_completion("hi", page=explicit_page)
+        try:
+            # Generator suspends on the 180s queue wait; 0.5s in, _sign_url has
+            # already been awaited with whichever page `pg` resolved to.
+            await asyncio.wait_for(gen.__anext__(), timeout=0.5)
+        except TimeoutError:
+            pass
+        finally:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+        return captured.get("page")
+
+    page_used = asyncio.run(scenario())
+    bc.restart.assert_not_called()
+    assert page_used is explicit_page, (
+        "chat_completion must sign with the explicit page, not the default page"
+    )
+
+
 def test_captcha_failover_releases_service_context_no_reload(tmp_path, monkeypatch):
     """Tier-3 with the pool must NOT reload the shared page; it evicts the
     account's service context and lets routing move on."""

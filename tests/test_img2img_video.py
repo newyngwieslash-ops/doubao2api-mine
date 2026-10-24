@@ -64,6 +64,7 @@ def test_images_generations_with_tos_key(test_app):
             prompt="一只戴墨镜的猫",
             ratio="1:1",
             ref_image_key="tos-cn-i-mock/original.png",
+            page=None,
         )
 
 
@@ -87,6 +88,7 @@ def test_images_generations_with_base64_data_uri(test_app):
         prompt="生成相似图片",
         ratio="16:9",
         ref_image_key="tos-cn-i-mock/ref_image_123.png",
+        page=None,
     )
 
 
@@ -109,6 +111,7 @@ def test_images_edits_endpoint_json(test_app):
         prompt="变成赛博朋克风格",
         ratio="1:1",
         ref_image_key="tos-cn-i-mock/city.png",
+        page=None,
     )
 
 
@@ -128,6 +131,7 @@ def test_images_edits_endpoint_multipart(test_app):
         prompt="水彩画风格",
         ratio="1:1",
         ref_image_key="tos-cn-i-mock/ref_image_123.png",
+        page=None,
     )
 
 
@@ -151,6 +155,7 @@ def test_video_generations_with_reference_image(test_app):
         prompt="让镜头向前推进，树叶随风飘落",
         ratio="16:9",
         ref_image_key="tos-cn-i-mock/autumn_forest.png",
+        page=None,
     )
 
 
@@ -196,6 +201,7 @@ def test_video_generations_with_multiple_tos_keys(test_app):
             "tos-cn-i-mock/character.png",
             "tos-cn-i-mock/background.png",
         ],
+        page=None,
     )
 
 
@@ -220,6 +226,7 @@ def test_video_generations_with_comma_separated_keys(test_app):
             "tos-cn-i-mock/k1.png",
             "tos-cn-i-mock/k2.png",
         ],
+        page=None,
     )
 
 
@@ -251,6 +258,7 @@ def test_video_generations_with_multiple_base64_images(test_app):
             "tos-cn-i-mock/img_1.png",
             "tos-cn-i-mock/img_2.png",
         ],
+        page=None,
     )
 
 
@@ -282,6 +290,7 @@ def test_video_generations_multipart_multiple_files(test_app):
             "tos-cn-i-mock/file_1.png",
             "tos-cn-i-mock/file_2.png",
         ],
+        page=None,
     )
 
 
@@ -303,6 +312,7 @@ def test_images_generations_with_multiple_keys(test_app):
         ratio="1:1",
         ref_image_key="tos-cn-i-mock/r1.png",
         ref_image_keys=["tos-cn-i-mock/r1.png", "tos-cn-i-mock/r2.png"],
+        page=None,
     )
 
 

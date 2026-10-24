@@ -64,7 +64,7 @@ def test_video_generation_with_save_history(mock_client):
     )
     assert resp.status_code == 200
     mock_client.generate_video.assert_called_with(
-        prompt="森林日出", ratio="16:9", ref_image_key=None
+        prompt="森林日出", ratio="16:9", ref_image_key=None, page=None
     )
 
     # 2. With save_history=True in body -> passes save_history=True
@@ -74,7 +74,7 @@ def test_video_generation_with_save_history(mock_client):
     )
     assert resp2.status_code == 200
     mock_client.generate_video.assert_called_with(
-        prompt="海边日落", ratio="16:9", ref_image_key=None, save_history=True
+        prompt="海边日落", ratio="16:9", ref_image_key=None, save_history=True, page=None
     )
 
     # 3. With explicit memory_type=0 in body -> passes memory_type=0
@@ -84,7 +84,7 @@ def test_video_generation_with_save_history(mock_client):
     )
     assert resp3.status_code == 200
     mock_client.generate_video.assert_called_with(
-        prompt="极光星空", ratio="16:9", ref_image_key=None, memory_type=0
+        prompt="极光星空", ratio="16:9", ref_image_key=None, memory_type=0, page=None
     )
 
 
@@ -100,7 +100,7 @@ def test_images_generation_with_save_history(mock_client):
     )
     assert resp.status_code == 200
     mock_client.generate_image.assert_called_with(
-        prompt="水彩画城堡", ratio="1:1", ref_image_key=None, save_history=True
+        prompt="水彩画城堡", ratio="1:1", ref_image_key=None, save_history=True, page=None
     )
 
 

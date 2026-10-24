@@ -108,6 +108,40 @@ _MIN_DISPATCH_INTERVAL = float(os.environ.get("DOUBAO_MIN_INTERVAL", "0.2"))  # 
 # ── SSE keepalive interval (idle gap before emitting a comment frame) ──
 _KEEPALIVE_INTERVAL = float(os.environ.get("DOUBAO_KEEPALIVE_INTERVAL", "5"))
 
+# ── Account routing (context pool): conversation -> owning account id ──
+_conv_owner: Dict[str, str] = {}
+
+
+def _route_account(client, conversation_id: Optional[str]) -> Optional[Any]:
+    """Pick the account for a request: sticky by conversation, else next available.
+
+    Returns None -> caller uses the default page (pool off / empty pool).
+    Default DOUBAO_POOL_SIZE=1 disables the whole routing layer: the API then
+    behaves byte-identical with pre-pool single-account mode.
+    """
+    if os.environ.get("DOUBAO_POOL_SIZE", "1") == "1":
+        return None
+    am = getattr(client, "account_manager", None)
+    if not (am and am.accounts):
+        return None
+    if conversation_id:
+        owner = _conv_owner.get(conversation_id)
+        if owner:
+            acc = am.get_account(owner)
+            if acc and acc.status == "active":
+                return acc
+    return am.get_next_available_account()
+
+
+def _record_conv_owner(conversation_id: str, account_id: str) -> None:
+    """Remember which account a conversation lives on (session stickiness)."""
+    _conv_owner[conversation_id] = account_id
+    # ponytail: half-evict over 1024 entries; LRU dict if multi-tenant ever matters
+    if len(_conv_owner) > 1024:
+        for k in list(_conv_owner)[:512]:
+            _conv_owner.pop(k, None)
+
+
 # ── Model definitions & Aliases ──────────────────────────────
 
 CHAT_MODELS: Dict[str, int] = {
@@ -1007,6 +1041,15 @@ def create_app(
         # ── 3-Tier Captcha Defense & Account Failover ──
         await _resolve_captcha_or_failover(client)
 
+        # ── Account-pool routing: pick this request's service page ──
+        route_acc = _route_account(client, body.conversation_id)
+        svc_page = None
+        if route_acc:
+            svc_page = await client.acquire_service_page(route_acc)
+            if svc_page is None:
+                log.warning("Pool routing fell back to default page (acquire failed for %s)", route_acc.id)
+        route_acc_id = route_acc.id if route_acc else None
+
         # ── Request Dispatch Smoothing (anti-burst rate limit) ──
         global _last_dispatch_time
         async with _dispatch_lock:
@@ -1043,7 +1086,9 @@ def create_app(
                              messages_for_counting=body.messages,
                              auto_delete=auto_delete,
                              image_attachments=image_attachments,
-                             file_attachments=file_attachments),
+                             file_attachments=file_attachments,
+                             svc_page=svc_page,
+                             route_acc_id=route_acc_id),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -1057,6 +1102,8 @@ def create_app(
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
                     image_attachments=image_attachments,
                     file_attachments=file_attachments,
+                    svc_page=svc_page,
+                    route_acc_id=route_acc_id,
                 )
                 # Report to expert tracker (detect silent downgrade)
                 had_reasoning = bool(message.get("reasoning_content"))
@@ -1080,6 +1127,8 @@ def create_app(
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
                     image_attachments=image_attachments,
                     file_attachments=file_attachments,
+                    svc_page=svc_page,
+                    route_acc_id=route_acc_id,
                 )
                 finish_reason = "stop"
         except RuntimeError as exc:
@@ -1133,6 +1182,14 @@ def create_app(
         client = _get_client()
         await _resolve_captcha_or_failover(client)
 
+        # ── Account-pool routing: pick this request's service page ──
+        route_acc = _route_account(client, None)
+        svc_page = None
+        if route_acc:
+            svc_page = await client.acquire_service_page(route_acc)
+            if svc_page is None:
+                log.warning("Pool routing fell back to default page (acquire failed for %s)", route_acc.id)
+
         ratio = body.ratio or _size_to_ratio(body.size)
         ref_image_keys = []
         if body.ref_image_keys:
@@ -1175,6 +1232,7 @@ def create_app(
                 prompt=body.prompt,
                 ratio=ratio,
                 ref_image_key=ref_image_key,
+                page=svc_page,
                 **gen_kwargs,
             )
         except RuntimeError as exc:
@@ -1206,6 +1264,14 @@ def create_app(
         await bucket.acquire()
         client = _get_client()
         await _resolve_captcha_or_failover(client)
+
+        # ── Account-pool routing: pick this request's service page ──
+        route_acc = _route_account(client, None)
+        svc_page = None
+        if route_acc:
+            svc_page = await client.acquire_service_page(route_acc)
+            if svc_page is None:
+                log.warning("Pool routing fell back to default page (acquire failed for %s)", route_acc.id)
 
         content_type = request.headers.get("content-type", "")
         prompt = ""
@@ -1310,6 +1376,7 @@ def create_app(
                 prompt=prompt,
                 ratio=actual_ratio,
                 ref_image_key=ref_image_key,
+                page=svc_page,
                 **gen_kwargs,
             )
         except RuntimeError as exc:
@@ -1338,6 +1405,15 @@ def create_app(
         _check_auth(request)
         await bucket.acquire()
         client = _get_client()
+        await _resolve_captcha_or_failover(client)
+
+        # ── Account-pool routing: pick this request's service page ──
+        route_acc = _route_account(client, None)
+        svc_page = None
+        if route_acc:
+            svc_page = await client.acquire_service_page(route_acc)
+            if svc_page is None:
+                log.warning("Pool routing fell back to default page (acquire failed for %s)", route_acc.id)
 
         body = await request.json()
         prompt = body.get("prompt", "")
@@ -1363,6 +1439,7 @@ def create_app(
                 prompt=prompt,
                 lyric=body.get("lyric"),
                 genre=body.get("genre"),
+                page=svc_page,
                 **gen_kwargs,
             )
         except RuntimeError as exc:
@@ -1385,6 +1462,14 @@ def create_app(
         await bucket.acquire()
         client = _get_client()
         await _resolve_captcha_or_failover(client)
+
+        # ── Account-pool routing: pick this request's service page ──
+        route_acc = _route_account(client, None)
+        svc_page = None
+        if route_acc:
+            svc_page = await client.acquire_service_page(route_acc)
+            if svc_page is None:
+                log.warning("Pool routing fell back to default page (acquire failed for %s)", route_acc.id)
 
         content_type = request.headers.get("content-type", "")
         prompt = ""
@@ -1490,7 +1575,8 @@ def create_app(
 
         try:
             result = await client.generate_video(
-                prompt=prompt, ratio=ratio, ref_image_key=ref_image_key, **gen_kwargs
+                prompt=prompt, ratio=ratio, ref_image_key=ref_image_key,
+                page=svc_page, **gen_kwargs
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
@@ -1676,6 +1762,8 @@ def create_app(
         bot_id: Optional[str] = None,
         image_attachments: Optional[list[dict[str, Any]]] = None,
         file_attachments: Optional[list[dict[str, Any]]] = None,
+        svc_page: Optional[Any] = None,
+        route_acc_id: Optional[str] = None,
     ) -> dict:
         """Collect full chat response with thinking separation.
 
@@ -1703,6 +1791,7 @@ def create_app(
             bot_id=bot_id or None,
             image_attachments=image_attachments,
             file_attachments=file_attachments,
+            page=svc_page,
         ):
             if event.get("error"):
                 raise RuntimeError(
@@ -1729,6 +1818,8 @@ def create_app(
                 cid = client.extract_conversation_id(event)
                 if cid and cid != "0":
                     result_conversation_id = cid
+                    if route_acc_id:
+                        _record_conv_owner(cid, route_acc_id)
 
             event_type = event.get("_event", "")
 
@@ -1803,6 +1894,8 @@ def create_app(
         auto_delete: bool = False,
         image_attachments: Optional[list[dict[str, Any]]] = None,
         file_attachments: Optional[list[dict[str, Any]]] = None,
+        svc_page: Optional[Any] = None,
+        route_acc_id: Optional[str] = None,
     ):
         """Generate real-time SSE stream in OpenAI format via httpx streaming.
 
@@ -1855,6 +1948,7 @@ def create_app(
                 bot_id=bot_id or None,
                 image_attachments=image_attachments,
                 file_attachments=file_attachments,
+                page=svc_page,
             ).__aiter__()
 
             while True:
@@ -1887,6 +1981,8 @@ def create_app(
                     cid = client.extract_conversation_id(event)
                     if cid and cid != "0":
                         result_conversation_id = cid
+                        if route_acc_id:
+                            _record_conv_owner(cid, route_acc_id)
 
                 # --- error_code handling (risk control, session expired) ---
                 if event_type == "STREAM_ERROR" or event.get("error_code"):
