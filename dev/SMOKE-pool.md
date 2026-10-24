@@ -81,3 +81,20 @@ curl -N -X POST http://127.0.0.1:9090/v1/chat/completions \
 ## 结果回填后
 
 把本文件提交入库（`git add dev/SMOKE-pool.md && git commit -m "docs: context 池冒烟验收记录"`），即可宣告计划全部完成。任何一项不符，对照日志在仓库提 issue 或直接修。
+
+---
+
+## 实测记录（2026-10-24，单页模式 Pool=1 下的双账号验证）
+
+| 项目 | 结果 |
+|---|---|
+| 账号入池 | acc_default + acc_2fa9a2a0 均入池，probe_all 双 valid |
+| switch_to_account 切换 | ok（logged_in=true，active 正确更新） |
+| 新账号真实对话 | 3.5s 返回正常内容 |
+| 切回主号 | ok，health ok，无 captcha 残留 |
+| 视频生成（主号） | 222s 返回 MP4 直链 + 封面，即焚清理正常 |
+| 风控事件演练 | 710022004 触发 → Tier-4 弹窗 → 人工通过 → 看门狗自动痊愈 |
+
+备注：
+- Cookie 导入踩坑记录：从 DevTools Cookie 面板复制整张表格文本导入会得到无 sessionid 的坏条目（探活 401）；正确方式是「保存当前登录为账号」或只粘贴 sessionid 单值。
+- 池模式（DOUBAO_POOL_SIZE>1）的并行/粘性/池化逃生三项待下一次服务重启设 env 后验证；本次实测均运行在 Pool=1 缺省模式。
