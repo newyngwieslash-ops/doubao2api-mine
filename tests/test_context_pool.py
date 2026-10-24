@@ -238,3 +238,70 @@ def test_chat_completion_rebinds_page_after_restart():
         "chat_completion signed with a stale dead page instead of the "
         "post-restart default page"
     )
+
+
+def test_try_auto_solve_retries_once(monkeypatch):
+    bc = _bc()
+    bc._page = MagicMock()
+    calls = {"n": 0}
+
+    class FlakySolver:
+        async def detect_and_solve(self, page, timeout=8.0):
+            calls["n"] += 1
+            return calls["n"] >= 2   # fails first, succeeds second
+
+    # implementation imports inside the method; patch the import target instead:
+    import doubao2api.captcha_solver as cs
+    monkeypatch.setattr(cs, "SliderCaptchaSolver", FlakySolver)
+
+    assert asyncio.run(bc.try_auto_solve_captcha()) is True
+    assert calls["n"] == 2
+
+    calls["n"] = 0
+
+    class DeadSolver:
+        async def detect_and_solve(self, page, timeout=8.0):
+            calls["n"] += 1
+            return False
+
+    monkeypatch.setattr(cs, "SliderCaptchaSolver", DeadSolver)
+    assert asyncio.run(bc.try_auto_solve_captcha()) is False
+    assert calls["n"] == 2          # tried twice, not once, not forever
+
+
+def test_captcha_failover_releases_service_context_no_reload(tmp_path, monkeypatch):
+    """Tier-3 with the pool must NOT reload the shared page; it evicts the
+    account's service context and lets routing move on."""
+    from doubao2api.account_manager import AccountManager
+    from doubao2api.unified_server import create_app
+
+    am = AccountManager(filepath=str(tmp_path / "a.json"), strategy="failover")
+    acc1 = am.add_or_update_account("主号", {"sessionid": "s1"})
+    acc2 = am.add_or_update_account("副号", {"sessionid": "s2"})
+    am.set_active_account(acc1.id)
+
+    from tests.test_fatal_regressions import _mock_client
+    m = _mock_client()
+    m.account_manager = am
+    m.needs_captcha = True
+    m.is_captcha_visible = AsyncMock(return_value=True)
+    m.try_auto_solve_captcha = AsyncMock(return_value=False)
+    m.release_service_context = MagicMock()
+    # switch_to_account must NOT be called anymore in pool mode
+    m.switch_to_account = AsyncMock(return_value=True)
+
+    async def fake_chat(*a, **kw):
+        yield {"_event": "CHUNK_DELTA", "text": "ok"}
+
+    m.chat_completion = fake_chat
+
+    from fastapi.testclient import TestClient
+    tc = TestClient(create_app(browser_client=m))
+    resp = tc.post("/v1/chat/completions", json={
+        "model": "doubao-2.1-turbo", "stream": False,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert resp.status_code == 200, resp.text
+    assert am.get_account(acc1.id).status == "captcha"
+    m.release_service_context.assert_called_once_with(acc1.id)
+    m.switch_to_account.assert_not_called()      # no reload, no stream kill

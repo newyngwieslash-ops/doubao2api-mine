@@ -123,6 +123,7 @@ def test_captcha_failover_in_chat_completions(tmp_path):
     # Captcha is visible, auto-solver fails
     mock_client.is_captcha_visible = AsyncMock(return_value=True)
     mock_client.try_auto_solve_captcha = AsyncMock(return_value=False)
+    mock_client.release_service_context = MagicMock()
     mock_client.switch_to_account = AsyncMock(return_value=True)
     mock_client.extract_conversation_id = MagicMock(return_value="c_test")
 
@@ -140,9 +141,10 @@ def test_captcha_failover_in_chat_completions(tmp_path):
         "messages": [{"role": "user", "content": "hi"}]
     })
 
-    # Should succeed with 200 OK because it failed over to acc2!
+    # Should succeed with 200 OK: acc1's context evicted, routing moves to acc2
     assert resp.status_code == 200
     # acc1 was marked as captcha
     assert am.get_account(acc1.id).status == "captcha"
-    # switch_to_account was called with acc2's id
-    mock_client.switch_to_account.assert_called_once_with(acc2.id)
+    # Pool mode: failover evicts the captcha account's context, no reload
+    mock_client.release_service_context.assert_called_once_with(acc1.id)
+    mock_client.switch_to_account.assert_not_called()

@@ -325,24 +325,25 @@ class BrowserClient:
     async def try_auto_solve_captcha(self) -> bool:
         """Attempt to automatically detect and solve slider captcha.
 
-        Returns True if solved, False otherwise.
+        The solver's trajectory is randomized, so a single miss is not a verdict:
+        retry once before giving up on this account.
         """
         if not self._page:
             return False
-        try:
-            from .captcha_solver import SliderCaptchaSolver
-            solver = SliderCaptchaSolver()
-            solved = await solver.detect_and_solve(self._page)
+        from .captcha_solver import SliderCaptchaSolver
+        for attempt in range(2):
+            try:
+                solved = await SliderCaptchaSolver().detect_and_solve(self._page)
+            except Exception as e:
+                log.warning("Automated captcha solver error (attempt %d): %s", attempt + 1, e)
+                continue
             if solved:
                 self.clear_captcha()
                 self.record_success()
                 self._ready = True
-                log.info("Auto-solved slider captcha successfully!")
+                log.info("Auto-solved slider captcha (attempt %d)!", attempt + 1)
                 return True
-            return False
-        except Exception as e:
-            log.warning("Automated captcha solver error: %s", e)
-            return False
+        return False
 
     def record_failure(self, error_code: int = 0):
         """Track consecutive failures. Mark captcha-needed on 710022002 or 710022004."""

@@ -22,6 +22,7 @@ def _mock_client() -> MagicMock:
     m.is_ready = True
     m.extract_conversation_id = MagicMock(return_value=None)
     m.record_success = MagicMock()
+    m.release_service_context = MagicMock()
     m.delete_conversation = AsyncMock(return_value=True)
     return m
 

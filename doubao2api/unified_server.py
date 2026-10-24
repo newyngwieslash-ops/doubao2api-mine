@@ -917,24 +917,31 @@ def create_app(
         except Exception as e:
             log.warning("Tier 2 auto-solver failed: %s", e)
 
-        # Tier 3: Account pool failover (switch to next healthy account)
+        # Tier 3: Account pool failover
+        # Pool mode: evict the captcha account's service context — routing moves
+        # to other accounts, in-flight streams untouched, no page reload.
+        # Fallback mode (no pool attr): legacy reload-based switch.
         if client.account_manager and client.account_manager.accounts:
             current_acc = client.account_manager.get_active_account()
             if current_acc:
                 client.account_manager.mark_captcha_required(current_acc.id)
+                if hasattr(client, "release_service_context"):
+                    client.release_service_context(current_acc.id)
             next_acc = client.account_manager.get_next_available_account()
             if next_acc and (not current_acc or next_acc.id != current_acc.id):
                 log.warning(
-                    "Captcha hit on account %s. Auto-failing over to account %s (%s)...",
+                    "Captcha hit on account %s. Failing over to account %s (%s).",
                     current_acc.id if current_acc else "unknown",
-                    next_acc.id,
-                    next_acc.name,
+                    next_acc.id, next_acc.name,
                 )
-                ok = await client.switch_to_account(next_acc.id)
+                client.clear_captcha()
+                client._ready = True
+                return
+            if current_acc and not hasattr(client, "release_service_context"):
+                ok = await client.switch_to_account(current_acc.id)
                 if ok:
                     client.clear_captcha()
                     return
-                log.error("Failover to account %s failed; falling back to manual captcha", next_acc.id)
 
         # Tier 4: Fallback - popup desktop window and raise 503
         popped = await client.auto_popup_for_captcha()
