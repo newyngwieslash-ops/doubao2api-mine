@@ -7,6 +7,7 @@ self._page when no page is passed, byte-identical with today's behavior.
 """
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -431,3 +432,298 @@ def test_launch_args_contain_memory_flags():
     assert '"--disable-dev-shm-usage"' in src
     assert '"--js-flags=--max-old-space-size=256"' in src
     assert '"--disable-features=MediaRouter,Translate' in src
+
+
+# ---------------------------------------------------------------------------
+# F1 regression: pool-mode 即用即焚 auto-delete must run on the routed page
+# ---------------------------------------------------------------------------
+
+def test_delayed_delete_threads_svc_page_non_stream(monkeypatch):
+    """F1: pool-mode auto-delete must call delete_conversation with the request's
+    svc_page — the ephemeral conversation lives on the pool account's page, and
+    deleting with the default account's cookies silently fails."""
+    from doubao2api.account_manager import Account, AccountManager
+    from doubao2api.unified_server import create_app
+    from fastapi.testclient import TestClient
+
+    am = AccountManager(filepath=":")
+    acc1 = Account(id="a1", name="1", cookies={"sessionid": "s"})
+    am.accounts = {"a1": acc1}
+    am.active_account_id = "a1"
+    monkeypatch.setenv("DOUBAO_POOL_SIZE", "2")
+
+    from tests.test_fatal_regressions import _mock_client
+    m = _mock_client()
+    m.account_manager = am
+    svc_page = MagicMock()
+    m.acquire_service_page = AsyncMock(return_value=svc_page)
+    m.extract_conversation_id = MagicMock(side_effect=lambda ev: (
+        ev.get("ack_client_meta", {}) or {}).get("conversation_id"))
+
+    captured_delete = {}
+
+    async def fake_delete(conversation_id, page=None):
+        captured_delete["conversation_id"] = conversation_id
+        captured_delete["page"] = page
+        return True
+
+    m.delete_conversation = fake_delete
+
+    async def fake_chat(*args, **kwargs):
+        assert kwargs.get("page") is svc_page
+        yield {"_event": "CHUNK_DELTA", "text": "ok",
+               "ack_client_meta": {"conversation_id": "conv_pool_1"}}
+
+    m.chat_completion = fake_chat
+
+    tc = TestClient(create_app(browser_client=m))
+    with tc:
+        resp = tc.post("/v1/chat/completions", json={
+            "model": "doubao-2.1-turbo", "stream": False,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("conversation_id") == "conv_pool_1"
+
+        # The background delayed-delete task sleeps 0.8s inside the app's event
+        # loop; keep the lifespan (its loop) alive until it lands.
+        time.sleep(1.2)
+
+    assert captured_delete.get("conversation_id") == "conv_pool_1", (
+        "delayed auto-delete never fired"
+    )
+    assert captured_delete.get("page") is svc_page, (
+        "pool-mode auto-delete must pass the routed svc_page to "
+        "delete_conversation, not the default page"
+    )
+
+
+def test_delayed_delete_threads_svc_page_stream(monkeypatch):
+    """F1 (stream path): _stream_chat's trailing auto-delete must carry svc_page."""
+    from doubao2api.account_manager import Account, AccountManager
+    from doubao2api.unified_server import create_app
+    from fastapi.testclient import TestClient
+
+    am = AccountManager(filepath=":")
+    acc1 = Account(id="a1", name="1", cookies={"sessionid": "s"})
+    am.accounts = {"a1": acc1}
+    am.active_account_id = "a1"
+    monkeypatch.setenv("DOUBAO_POOL_SIZE", "2")
+
+    from tests.test_fatal_regressions import _mock_client
+    m = _mock_client()
+    m.account_manager = am
+    svc_page = MagicMock()
+    m.acquire_service_page = AsyncMock(return_value=svc_page)
+    m.extract_conversation_id = MagicMock(side_effect=lambda ev: (
+        ev.get("ack_client_meta", {}) or {}).get("conversation_id"))
+
+    captured_delete = {}
+
+    async def fake_delete(conversation_id, page=None):
+        captured_delete["page"] = page
+        return True
+
+    m.delete_conversation = fake_delete
+
+    async def fake_chat(*args, **kwargs):
+        yield {"_event": "CHUNK_DELTA", "text": "ok",
+               "ack_client_meta": {"conversation_id": "conv_stream_1"}}
+
+    m.chat_completion = fake_chat
+
+    tc = TestClient(create_app(browser_client=m))
+    with tc:
+        with tc.stream("POST", "/v1/chat/completions", json={
+            "model": "doubao-2.1-turbo", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        }) as resp:
+            assert resp.status_code == 200
+            body = b"".join(resp.iter_raw())
+
+        assert b"conv_stream_1" in body
+        # keep the app's event loop alive for the 0.8s delayed-delete task
+        time.sleep(1.2)
+
+    assert captured_delete.get("page") is svc_page, (
+        "stream-path auto-delete must run on the routed svc_page"
+    )
+
+
+def test_video_ephemeral_delete_threads_svc_page(monkeypatch):
+    """F1 (video endpoint): ephemeral video conversation cleanup must run on
+    the routed svc_page."""
+    from doubao2api.account_manager import Account, AccountManager
+    from doubao2api.unified_server import create_app
+    from fastapi.testclient import TestClient
+
+    am = AccountManager(filepath=":")
+    acc1 = Account(id="a1", name="1", cookies={"sessionid": "s"})
+    am.accounts = {"a1": acc1}
+    am.active_account_id = "a1"
+    monkeypatch.setenv("DOUBAO_POOL_SIZE", "2")
+
+    from tests.test_fatal_regressions import _mock_client
+    m = _mock_client()
+    m.account_manager = am
+    svc_page = MagicMock()
+    m.acquire_service_page = AsyncMock(return_value=svc_page)
+
+    captured = {}
+
+    async def fake_generate_video(*args, **kwargs):
+        captured["gen_page"] = kwargs.get("page")
+        return {"videos": [{"video_url": "https://tos.mock/v.mp4"}],
+                "conversation_id": "conv_video_1"}
+
+    async def fake_delete(conversation_id, page=None):
+        captured["del_page"] = page
+        return True
+
+    m.generate_video = fake_generate_video
+    m.delete_conversation = fake_delete
+
+    tc = TestClient(create_app(browser_client=m))
+    resp = tc.post("/v1/video/generations", json={
+        "prompt": "森林日出", "ratio": "16:9",
+    })
+    assert resp.status_code == 200, resp.text
+    assert captured["gen_page"] is svc_page
+    assert captured["del_page"] is svc_page, (
+        "video ephemeral cleanup must delete on the routed svc_page"
+    )
+
+
+# ---------------------------------------------------------------------------
+# F2 regression: pool-mode video quota must not switch_to_account / mark wrong
+# ---------------------------------------------------------------------------
+
+def test_generate_video_quota_on_pool_page_marks_routed_account_only():
+    """F2: with an explicit (pool) page, a quota error must mark the ROUTED
+    account (reverse-looked-up from _svc), never switch_to_account (which
+    reloads the default page and would cascade false quota flags), and raise
+    a structured error for the endpoint layer."""
+    import json as _json
+    bc = _bc()
+
+    pool_page = MagicMock()
+    bc._svc["acc_routed"] = {"context": MagicMock(), "page": pool_page}
+
+    from doubao2api.account_manager import Account, AccountManager
+    am = AccountManager(filepath=":")
+    acc_default = Account(id="acc_default", name="默认", cookies={"sessionid": "s"})
+    acc_routed = Account(id="acc_routed", name="路由号", cookies={"sessionid": "s"})
+    acc_other = Account(id="acc_other", name="备用", cookies={"sessionid": "s"})
+    am.accounts = {a.id: a for a in (acc_default, acc_routed, acc_other)}
+    am.active_account_id = "acc_default"
+    bc.account_manager = am
+
+    async def fake_samantha_request(payload, timeout=60, page=None):
+        # 2005 event carrying the Doubao quota-exceeded text
+        sse_event = {"event_type": 2005, "event_data": "今日生成次数已达上限"}
+        return f"data: {_json.dumps(sse_event, ensure_ascii=False)}\n\n"
+
+    bc._samantha_request = fake_samantha_request
+    bc._list_recent_thread_ids = AsyncMock(return_value=[])
+    bc.switch_to_account = AsyncMock(side_effect=AssertionError(
+        "switch_to_account must not run for pool-routed video quota errors"))
+
+    with pytest.raises(RuntimeError, match="quota exceeded.*acc_routed"):
+        asyncio.run(bc.generate_video(prompt="日落", page=pool_page))
+
+    bc.switch_to_account.assert_not_called()
+    # routed account flagged, default/other accounts untouched
+    assert am.get_account("acc_routed").status == "quota_exceeded"
+    assert am.get_account("acc_default").status == "active"
+    assert am.get_account("acc_other").status == "active"
+
+
+def test_generate_video_quota_on_default_page_keeps_legacy_failover():
+    """F2 guard: default-page (page=None) quota errors keep the legacy
+    mark-active + switch_to_account failover, byte-identical with pre-pool."""
+    import json as _json
+    bc = _bc()
+
+    from doubao2api.account_manager import Account, AccountManager
+    am = AccountManager(filepath=":")
+    acc_default = Account(id="acc_default", name="默认", cookies={"sessionid": "s"})
+    acc_other = Account(id="acc_other", name="备用", cookies={"sessionid": "s"})
+    am.accounts = {a.id: a for a in (acc_default, acc_other)}
+    am.active_account_id = "acc_default"
+    bc.account_manager = am
+
+    calls = {"n": 0}
+
+    async def fake_samantha_request(payload, timeout=60, page=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            sse_event = {"event_type": 2005, "event_data": "今日生成次数已达上限"}
+            return f"data: {_json.dumps(sse_event, ensure_ascii=False)}\n\n"
+        # Retry succeeds with an async task
+        sse_event = {
+            "event_type": 2001,
+            "event_data": {"fin_reason": {"reason": 1, "async_task": {"id": "task_ok"}}},
+        }
+        return f"data: {_json.dumps(sse_event)}\n\n"
+
+    bc._samantha_request = fake_samantha_request
+    bc._list_recent_thread_ids = AsyncMock(return_value=[])
+    bc.switch_to_account = AsyncMock(return_value=True)
+    bc._poll_video_result = AsyncMock(return_value={"videos": [{"video_url": "u.mp4"}], "prompt": "日落"})
+
+    res = asyncio.run(bc.generate_video(prompt="日落"))
+    assert res["videos"][0]["video_url"] == "u.mp4"
+    bc.switch_to_account.assert_awaited_once()
+    assert am.get_account("acc_default").status == "quota_exceeded"
+
+
+def test_generate_video_quota_full_text_on_pool_page_no_recursion():
+    """F2 (full_text branch): quota detected in the completion text on a pool
+    page must mark the routed account and raise — no switch, no recursion."""
+    import json as _json
+    bc = _bc()
+
+    pool_page = MagicMock()
+    bc._svc["acc_routed"] = {"context": MagicMock(), "page": pool_page}
+
+    from doubao2api.account_manager import Account, AccountManager
+    am = AccountManager(filepath=":")
+    acc_default = Account(id="acc_default", name="默认", cookies={"sessionid": "s"})
+    acc_routed = Account(id="acc_routed", name="路由号", cookies={"sessionid": "s"})
+    am.accounts = {a.id: a for a in (acc_default, acc_routed)}
+    am.active_account_id = "acc_default"
+    bc.account_manager = am
+
+    async def fake_samantha_request(payload, timeout=60, page=None):
+        # 2001 event whose message text carries the quota-exceeded wording
+        inner = _json.dumps({"text": "您的视频生成次数已达上限，请明天再试"}, ensure_ascii=False)
+        sse_event = {
+            "event_type": 2001,
+            "event_data": {"message": {"content_type": 2001, "content": inner}},
+        }
+        return f"data: {_json.dumps(sse_event, ensure_ascii=False)}\n\n"
+
+    bc._samantha_request = fake_samantha_request
+    bc._list_recent_thread_ids = AsyncMock(return_value=[])
+    bc.switch_to_account = AsyncMock(side_effect=AssertionError(
+        "switch_to_account must not run for pool-routed video quota errors"))
+
+    with pytest.raises(RuntimeError, match="quota exceeded.*acc_routed"):
+        asyncio.run(bc.generate_video(prompt="日落", page=pool_page))
+
+    bc.switch_to_account.assert_not_called()
+    assert am.get_account("acc_routed").status == "quota_exceeded"
+    assert am.get_account("acc_default").status == "active"
+
+
+def test_svc_account_id_for_page_lookup():
+    bc = _bc()
+    page_a = MagicMock()
+    page_b = MagicMock()
+    bc._svc["a"] = {"context": MagicMock(), "page": page_a}
+    bc._svc["b"] = {"context": MagicMock(), "page": page_b}
+
+    assert bc._svc_account_id_for_page(None) is None     # default page
+    assert bc._svc_account_id_for_page(page_a) == "a"
+    assert bc._svc_account_id_for_page(page_b) == "b"
+    assert bc._svc_account_id_for_page(MagicMock()) is None  # unknown page

@@ -1170,8 +1170,11 @@ def create_app(
             resp_data["conversation_id"] = message["conversation_id"]
 
         # Auto-delete ephemeral conversation in background (即用即焚 / Scheme B)
+        # 池模式：会话在路由账号的服务页上，删除必须走同一页的 cookie
         if auto_delete and message.get("conversation_id"):
-            asyncio.create_task(_delayed_delete(client, message["conversation_id"]))
+            asyncio.create_task(_delayed_delete(
+                client, message["conversation_id"], svc_page=svc_page,
+            ))
 
         return JSONResponse(resp_data)
 
@@ -1594,9 +1597,10 @@ def create_app(
 
         # Video results are read from the persisted conversation, so clean it up
         # afterwards to honour the ephemeral ("即用即焚") setting.
+        # 池模式：会话在路由账号的服务页上，删除必须走同一页的 cookie
         if conversation_id and ephemeral_conv:
             try:
-                await client.delete_conversation(conversation_id)
+                await client.delete_conversation(conversation_id, page=svc_page)
             except Exception as exc:
                 log.warning("Failed to delete video conversation %s: %s", conversation_id, exc)
 
@@ -1744,12 +1748,21 @@ def create_app(
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
-    async def _delayed_delete(client: BrowserClient, conversation_id: str, delay: float = 0.8):
-        """Asynchronously delete ephemeral conversation in background (即用即焚)."""
+    async def _delayed_delete(
+        client: BrowserClient, conversation_id: str, delay: float = 0.8,
+        svc_page: Optional[Any] = None,
+    ):
+        """Asynchronously delete ephemeral conversation in background (即用即焚).
+
+        svc_page: the pool-routed service page the conversation lives on. Must be
+        passed for pool-mode requests — the ephemeral conversation belongs to the
+        routed account's page; deleting via the default page's cookies fails
+        silently and the conversation lingers in the pool account's web history.
+        """
         try:
             if delay > 0:
                 await asyncio.sleep(delay)
-            await client.delete_conversation(conversation_id)
+            await client.delete_conversation(conversation_id, page=svc_page)
         except Exception as exc:
             log.warning("Delayed delete failed for %s: %s", conversation_id, exc)
 
@@ -2271,8 +2284,11 @@ def create_app(
         yield "data: [DONE]\n\n"
 
         # Ephemeral conversation auto-delete (Scheme B: 即用即焚)
+        # 池模式：会话在路由账号的服务页上，删除必须走同一页的 cookie
         if auto_delete and result_conversation_id:
-            asyncio.create_task(_delayed_delete(client, result_conversation_id))
+            asyncio.create_task(_delayed_delete(
+                client, result_conversation_id, svc_page=svc_page,
+            ))
 
     # ── Admin Dashboard & Auth ──
 
