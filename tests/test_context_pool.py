@@ -98,3 +98,89 @@ def test_browser_fetch_stream_accepts_page(monkeypatch):
 
     asyncio.run(bc._browser_fetch_stream("http://x", payload, "r2", page=explicit))
     explicit.evaluate.assert_awaited()
+
+
+def test_to_playwright_cookies_shape():
+    bc = _bc()
+    pw = bc._to_playwright_cookies({"sessionid": "s1", "msToken": "m1"})
+    assert pw == [
+        {"name": "sessionid", "value": "s1", "domain": ".doubao.com", "path": "/"},
+        {"name": "msToken", "value": "m1", "domain": ".doubao.com", "path": "/"},
+    ]
+
+
+def test_acquire_service_page_creates_per_account_context(monkeypatch):
+    # pool of 2: both accounts fit, so no LRU eviction interferes with the
+    # per-account-context assertions below.
+    monkeypatch.setenv("DOUBAO_POOL_SIZE", "2")
+    bc = _bc()
+    from doubao2api.account_manager import Account
+
+    created = []
+
+    async def fake_goto(url, **kw):
+        return None
+
+    class FakeCtx:
+        def __init__(self):
+            self.cookies_added = None
+
+        async def add_cookies(self, c):
+            self.cookies_added = c
+
+        async def new_page(self):
+            page = MagicMock()
+            page.is_closed = lambda: False
+            page.goto = fake_goto
+            return page
+
+        async def close(self):
+            if self in created:
+                created.remove(self)
+
+    class FakeBrowser:
+        async def new_context(self, **kw):
+            ctx = FakeCtx()
+            created.append(ctx)
+            return ctx
+
+    async def fake_bridge(page=None):
+        return None
+
+    async def fake_signing(page=None):
+        return None
+
+    # instance-level fakes: acquire_service_page still routes through these
+    bc._setup_fetch_bridge = fake_bridge
+    bc._wait_for_signing = fake_signing
+
+    bc._context = MagicMock()
+    bc._context.browser = FakeBrowser()
+    bc._ready = True
+
+    acc = Account(id="a1", name="acc1", cookies={"sessionid": "s1"})
+
+    page1 = asyncio.run(bc.acquire_service_page(acc))
+    page2 = asyncio.run(bc.acquire_service_page(acc))
+    assert page1 is page2                      # same account -> cached page
+    assert len(created) == 1                   # one context for that account
+    assert created[0].cookies_added[0]["name"] == "sessionid"
+    assert created[0].cookies_added[0]["domain"] == ".doubao.com"
+
+    acc2 = Account(id="a2", name="acc2", cookies={"sessionid": "s2"})
+    page3 = asyncio.run(bc.acquire_service_page(acc2))
+    assert len(created) == 2                    # second account -> second context
+    assert page3 is not page1
+
+    # release closes and evicts only the targeted account's context
+    bc.release_service_context("a1")
+    assert "a1" not in bc._svc
+    assert bc._svc["a2"]["page"] is page3       # untouched account stays pooled
+
+
+def test_acquire_returns_none_when_context_dead():
+    bc = _bc()
+    bc._context = None   # browser not started
+    from doubao2api.account_manager import Account
+    acc = Account(id="a1", name="acc1", cookies={"sessionid": "s1"})
+    assert asyncio.run(bc.acquire_service_page(acc)) is None

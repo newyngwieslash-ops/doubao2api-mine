@@ -207,6 +207,10 @@ class BrowserClient:
         self._mode_lock: asyncio.Lock = asyncio.Lock()
         # In-flight long page streams; switch_to_account drains them before reload
         self._active_streams = 0
+        # Per-account service contexts: account_id -> {"context", "page"}
+        # Lazy: created on first routed request, capped by DOUBAO_POOL_SIZE.
+        self._svc: Dict[str, dict] = {}
+        self._pool_size = max(1, int(os.environ.get("DOUBAO_POOL_SIZE", "1")))
         # Stream bridge: request_id -> asyncio.Queue for SSE chunks
         self._stream_queues: Dict[str, asyncio.Queue] = {}
         # Fetch-bridge registration is per-context; track which pages have it
@@ -648,6 +652,10 @@ class BrowserClient:
                 await self._playwright.stop()
             except Exception:
                 pass
+        # Pool contexts are incognito children of the same tree; close each
+        # explicitly (and drop bridge refs) before the root goes away.
+        for acc_id in list(self._svc):
+            self.release_service_context(acc_id)
         self._context = None
         self._playwright = None
         self._page = None
@@ -985,14 +993,7 @@ class BrowserClient:
             return False
 
         # Build cookie list for Playwright
-        pw_cookies = []
-        for name, value in cookies.items():
-            pw_cookies.append({
-                "name": name,
-                "value": value,
-                "domain": ".doubao.com",
-                "path": "/",
-            })
+        pw_cookies = self._to_playwright_cookies(cookies)
 
         await self._context.add_cookies(pw_cookies)
         log.info("Injected %d cookies into browser context", len(pw_cookies))
@@ -1036,6 +1037,85 @@ class BrowserClient:
             self.account_manager.set_active_account(acc.id)
             log.info("Successfully switched to account %s (%s)", acc.id, acc.name)
         return ok
+
+    # ------------------------------------------------------------------
+    # Per-account service context pool
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_playwright_cookies(cookies: Dict[str, str]) -> List[dict]:
+        """Convert an account's cookie dict to a Playwright add_cookies list."""
+        return [
+            {"name": name, "value": value, "domain": ".doubao.com", "path": "/"}
+            for name, value in cookies.items()
+        ]
+
+    async def acquire_service_page(self, acc) -> Optional[Page]:
+        """Get or create this account's isolated service page (incognito context
+        on the same Chromium tree). Returns None if the browser isn't up.
+
+        ponytail: over-pool-size requests reuse the LRU account page instead of
+        queueing — single-user service, serial beats backlog.
+        """
+        if not self._context or not getattr(self._context, "browser", None):
+            return None
+
+        s = self._svc.get(acc.id)
+        if s and not s["page"].is_closed():
+            return s["page"]
+
+        # Enforce pool size by evicting the least-recently-used entry
+        while len(self._svc) >= self._pool_size:
+            lru_id = next(iter(self._svc))
+            if lru_id == acc.id and len(self._svc) == 1:
+                break
+            self.release_service_context(lru_id)
+
+        ctx = None
+        try:
+            ctx = await self._context.browser.new_context(
+                viewport={"width": 1280, "height": 720}, locale="zh-CN",
+            )
+            await ctx.add_cookies(self._to_playwright_cookies(acc.cookies))
+            page = await ctx.new_page()
+            await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=45000)
+            await self._setup_fetch_bridge(page)
+            await self._wait_for_signing(page)
+            self._svc[acc.id] = {"context": ctx, "page": page}
+            log.info("Service context ready for account %s (%s), pool=%d/%d",
+                     acc.id, acc.name, len(self._svc), self._pool_size)
+            return page
+        except Exception as e:
+            log.error("acquire_service_page failed for %s: %s", acc.id, e)
+            if ctx is not None:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+            return None
+
+    def release_service_context(self, account_id: str) -> None:
+        """Close and evict an account's service context (captcha / invalid cookie)."""
+        s = self._svc.pop(account_id, None)
+        if not s:
+            return
+        ctx = s["context"]
+        # Drop bridge tracking first: the strong Page ref must not outlive the
+        # context (Task 2 review follow-up — otherwise _bridged_pages leaks).
+        try:
+            self._bridged_pages.discard(s["page"])
+        except Exception:
+            pass
+        # close() is sync-scheduled; in-flight fetches on that page fail fast
+        # and their event streams end naturally. Eviction above already
+        # unhooks the pool, so closing is the last step ("先关后记" semantics:
+        # pop first so a concurrent acquire can never hand out a dying page).
+        try:
+            asyncio.get_running_loop().create_task(ctx.close())
+        except RuntimeError:
+            pass
+        log.info("Service context released for account %s", account_id)
+
     # ------------------------------------------------------------------
     # Signing & Cookies
     # ------------------------------------------------------------------
@@ -1167,8 +1247,12 @@ class BrowserClient:
         use_deep_think: int = 0,
         image_attachments: Optional[List[Dict[str, Any]]] = None,
         file_attachments: Optional[List[Dict[str, Any]]] = None,
+        page: Optional[Page] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Send a chat message and yield SSE events via in-browser fetch."""
+        # 穿透：显式 page 用该页执行签名与 fetch；缺省回退默认页，行为不变。
+        # 自愈（liveness check / restart）只属默认页；服务页死亡由池重建处理。
+        pg = page or self._page
         if not self._page or self._page.is_closed() or not await self.is_alive():
             log.warning("Browser page is closed or not alive. Auto-recovering browser now...")
             await self.restart()
@@ -1359,7 +1443,7 @@ class BrowserClient:
 
         # Build URL with query params and X-Bogus signature via bdms.frontierSign
         query_params = self._build_query_params()
-        url = await self._sign_url("/chat/completion", query_params)
+        url = await self._sign_url("/chat/completion", query_params, page=pg)
 
         request_id = f"req_{uuid.uuid4().hex[:16]}"
         queue: asyncio.Queue = asyncio.Queue()
@@ -1370,7 +1454,7 @@ class BrowserClient:
 
         # Launch browser fetch in background with completion watcher
         eval_task = asyncio.create_task(
-            self._browser_fetch_stream(url, payload, request_id)
+            self._browser_fetch_stream(url, payload, request_id, page=pg)
         )
 
         def _on_eval_done(task: asyncio.Task):
@@ -1524,6 +1608,7 @@ class BrowserClient:
         conversation_id: Optional[str] = None,
         bot_id: Optional[str] = None,
         use_deep_think: int = 0,
+        page: Optional[Page] = None,
     ) -> Dict[str, Any]:
         """Send message, collect full response. Returns {text, conversation_id}."""
         full_text = ""
@@ -1532,7 +1617,7 @@ class BrowserClient:
 
         async for event in self.chat_completion(
             text, conversation_id=conversation_id,
-            bot_id=bot_id, use_deep_think=use_deep_think
+            bot_id=bot_id, use_deep_think=use_deep_think, page=page
         ):
             events.append(event)
             if event.get("error"):
@@ -1598,7 +1683,9 @@ class BrowserClient:
             return meta["conversation_id"]
         return None
 
-    async def delete_conversation(self, conversation_id: str) -> bool:
+    async def delete_conversation(
+        self, conversation_id: str, page: Optional[Page] = None
+    ) -> bool:
         """Delete a conversation from Doubao via /im/conversation/batch_del_user_conv.
 
         Keeps the web UI sidebar completely clean (即用即焚 / Ephemeral Conversations).
@@ -1611,9 +1698,12 @@ class BrowserClient:
             log.warning("Cannot delete conversation %s: browser not ready", conversation_id)
             return False
 
+        pg = page or self._page
         query_params = self._build_query_params()
         try:
-            signed_url = await self._sign_url("/im/conversation/batch_del_user_conv", query_params)
+            signed_url = await self._sign_url(
+                "/im/conversation/batch_del_user_conv", query_params, page=pg
+            )
         except Exception as exc:
             log.warning("Failed to sign delete url for %s: %s", conversation_id, exc)
             return False
@@ -1633,7 +1723,7 @@ class BrowserClient:
         }
 
         try:
-            res = await self._page.evaluate('''async (args) => {
+            res = await pg.evaluate('''async (args) => {
                 const [url, payload] = args;
                 const csrfMatch = document.cookie.match(/passport_csrf_token=([^;]+)/);
                 const csrf = csrfMatch ? csrfMatch[1] : "";
@@ -1678,15 +1768,17 @@ class BrowserClient:
         self,
         payload: Dict[str, Any],
         timeout: float = 120,
+        page: Optional[Page] = None,
     ) -> str:
         """Send a request to /samantha/chat/completion via in-browser fetch."""
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
 
+        pg = page or self._page
         query_params = self._build_query_params()
         # Sign the URL like the chat endpoint does; unsigned requests are
         # rejected by ByteDance risk control (710022004 / verify slider).
-        url = await self._sign_url("/samantha/chat/completion", query_params)
+        url = await self._sign_url("/samantha/chat/completion", query_params, page=pg)
 
         js_code = """
         async ([url, payloadJson, timeoutMs]) => {
@@ -1726,7 +1818,7 @@ class BrowserClient:
         timeout_ms = int(timeout * 1000)
 
         log.info("POST %s [browser fetch, timeout=%ds]", url.split("?")[0], timeout)
-        result = await self._page.evaluate(
+        result = await pg.evaluate(
             js_code, [url, payload_json, timeout_ms]
         )
 
@@ -1778,6 +1870,7 @@ class BrowserClient:
         ref_image_keys: Optional[List[str]] = None,
         memory_type: Optional[int] = None,
         save_history: Optional[bool] = None,
+        page: Optional[Page] = None,
     ) -> Dict[str, Any]:
         """Generate images using /samantha/chat/completion.
 
@@ -1849,7 +1942,7 @@ class BrowserClient:
         }
 
         log.info("generate_image: prompt=%s, ratio=%s", prompt[:50], ratio)
-        raw = await self._samantha_request(payload, timeout=120)
+        raw = await self._samantha_request(payload, timeout=120, page=page)
 
         # Parse response - look for content_type=2010 (image output)
         images = []
@@ -1912,6 +2005,7 @@ class BrowserClient:
         genre: Optional[str] = None,
         memory_type: Optional[int] = None,
         save_history: Optional[bool] = None,
+        page: Optional[Page] = None,
     ) -> Dict[str, Any]:
         """Generate music using /samantha/chat/completion.
 
@@ -1971,7 +2065,7 @@ class BrowserClient:
         }
 
         log.info("generate_music: prompt=%s", prompt[:50])
-        raw = await self._samantha_request(payload, timeout=300)
+        raw = await self._samantha_request(payload, timeout=300, page=page)
 
         # Parse: find last content_type=2006 with video_model
         tracks = []
@@ -2075,6 +2169,7 @@ class BrowserClient:
         ref_image_keys: Optional[List[str]] = None,
         memory_type: Optional[int] = None,
         save_history: Optional[bool] = None,
+        page: Optional[Page] = None,
     ) -> Dict[str, Any]:
         """Generate video using /samantha/chat/completion (async 2-step).
 
@@ -2127,7 +2222,7 @@ class BrowserClient:
         if eff_mem_type == 2:
             log.info("generate_video: forcing memory_type=0 (ephemeral conversations cannot deliver async video results)")
             eff_mem_type = 0
-        pre_thread_ids = await self._list_recent_thread_ids()
+        pre_thread_ids = await self._list_recent_thread_ids(page=page)
         payload = {
             "messages": [message],
             "completion_option": {
@@ -2152,7 +2247,7 @@ class BrowserClient:
         }
 
         log.info("generate_video: prompt=%s, ratio=%s, memory_type=%s, attachments_count=%d", prompt[:50], ratio, eff_mem_type, len(attachments))
-        raw = await self._samantha_request(payload, timeout=60)
+        raw = await self._samantha_request(payload, timeout=60, page=page)
 
         # Phase 1: Extract async task_id from fin_reason
         task_id = None
@@ -2176,6 +2271,7 @@ class BrowserClient:
                                     ref_image_keys=ref_image_keys,
                                     memory_type=memory_type,
                                     save_history=save_history,
+                                    page=page,
                                 )
                 raise RuntimeError(f"generate_video error: {str(detail)[:500]}")
             if et != 2001:
@@ -2219,7 +2315,7 @@ class BrowserClient:
                 if next_acc:
                     log.info("Video quota exceeded in full_text. Auto-switching to account %s (%s)...", next_acc.id, next_acc.name)
                     if await self.switch_to_account(next_acc.id):
-                        return await self.generate_video(prompt=prompt, ratio=ratio, ref_image_key=ref_image_key)
+                        return await self.generate_video(prompt=prompt, ratio=ratio, ref_image_key=ref_image_key, page=page)
 
         if "服务过载" in full_text or "重试" in full_text:
             raise RuntimeError("视频生成服务过载，请稍后重试")
@@ -2231,7 +2327,7 @@ class BrowserClient:
             if full_text:
                 if _video_generation_started(full_text):
                     timeout = float(os.environ.get("DOUBAO_VIDEO_TIMEOUT", "420"))
-                    video = await self._wait_for_generated_video(pre_thread_ids, timeout=timeout)
+                    video = await self._wait_for_generated_video(pre_thread_ids, timeout=timeout, page=page)
                     if video:
                         return {
                             "videos": [video],
@@ -2243,28 +2339,33 @@ class BrowserClient:
 
         # Phase 2: Poll for result
         log.info("generate_video: polling task_id=%s", task_id)
-        return await self._poll_video_result(task_id, prompt)
+        return await self._poll_video_result(task_id, prompt, page=page)
 
-    async def _list_recent_thread_ids(self, count: int = 10) -> List[str]:
+    async def _list_recent_thread_ids(
+        self, count: int = 10, page: Optional[Page] = None
+    ) -> List[str]:
         """Return recent conversation thread ids (newest first).
 
         Used to detect the conversation created by a video request, because the
         completion response itself no longer carries an async task id.
         """
         try:
-            threads = await self._thread_list(count)
+            threads = await self._thread_list(count, page=page)
             return [str(t.get("thread_id_str") or t.get("thread_id") or "") for t in threads]
         except Exception as exc:
             log.debug("thread list failed: %s", exc)
             return []
 
-    async def _thread_list(self, count: int = 10) -> List[Dict[str, Any]]:
+    async def _thread_list(
+        self, count: int = 10, page: Optional[Page] = None
+    ) -> List[Dict[str, Any]]:
         """Call POST /samantha/thread/list with a signed URL."""
         if not self._ready or self._page is None:
             return []
+        pg = page or self._page
         query_params = self._build_query_params()
-        signed_url = await self._sign_url("/samantha/thread/list", query_params)
-        result = await self._page.evaluate(
+        signed_url = await self._sign_url("/samantha/thread/list", query_params, page=pg)
+        result = await pg.evaluate(
             """
             async ([url, body]) => {
                 const res = await fetch(url, {
@@ -2284,7 +2385,8 @@ class BrowserClient:
         return (data.get("data") or {}).get("thread_list") or []
 
     async def _wait_for_generated_video(
-        self, pre_thread_ids: List[str], timeout: float = 300
+        self, pre_thread_ids: List[str], timeout: float = 300,
+        page: Optional[Page] = None,
     ) -> Optional[Dict[str, Any]]:
         """Wait for the video of a freshly submitted task and return its URL.
 
@@ -2299,7 +2401,7 @@ class BrowserClient:
         while time.time() < deadline:
             await asyncio.sleep(10)
             try:
-                threads = await self._thread_list(10)
+                threads = await self._thread_list(10, page=page)
             except Exception:
                 continue
             if not threads:
@@ -2318,7 +2420,7 @@ class BrowserClient:
             if idx <= baseline_index:
                 continue
             # New messages landed — open the conversation and extract the video.
-            video = await self._extract_video_from_thread(thread_id)
+            video = await self._extract_video_from_thread(thread_id, page=page)
             if video:
                 log.info("Video ready in thread %s", thread_id)
                 video["_thread_id"] = thread_id
@@ -2326,24 +2428,30 @@ class BrowserClient:
         log.warning("Timed out waiting for generated video (thread=%s)", thread_id)
         return None
 
-    async def _extract_video_from_thread(self, thread_id: str) -> Optional[Dict[str, Any]]:
+    async def _extract_video_from_thread(
+        self, thread_id: str, page: Optional[Page] = None
+    ) -> Optional[Dict[str, Any]]:
         """Open a conversation in a temporary tab and read the newest video URL.
 
         A separate tab is used on purpose: navigating the main page would drop the
-        exposed ``__doubaoStreamChunk`` binding used by chat streaming.
+        exposed ``__doubaoStreamChunk`` binding used by chat streaming. With an
+        explicit ``page`` (service pool), its own context hosts the temp tab so
+        the account's cookies stay isolated.
         """
-        if self._context is None:
+        pg = page or self._page
+        ctx = getattr(pg, "context", None) or self._context
+        if ctx is None:
             return None
-        page = None
+        tab = None
         try:
-            page = await self._context.new_page()
-            await page.goto(
+            tab = await ctx.new_page()
+            await tab.goto(
                 f"{DOUBAO_URL}/chat/{thread_id}",
                 wait_until="domcontentloaded",
                 timeout=45000,
             )
             await asyncio.sleep(4)
-            await page.evaluate(
+            await tab.evaluate(
                 """() => {
                     document.querySelectorAll('.block-video-MzfWVN, [class*="block-video"]').forEach(el => {
                         try { el.click(); } catch (e) {}
@@ -2351,7 +2459,7 @@ class BrowserClient:
                 }"""
             )
             await asyncio.sleep(3)
-            info = await page.evaluate(
+            info = await tab.evaluate(
                 """() => {
                     const v = Array.from(document.querySelectorAll('video'))
                         .map(x => x.currentSrc || x.src)
@@ -2371,22 +2479,23 @@ class BrowserClient:
         except Exception as exc:
             log.warning("extract video from thread %s failed: %s", thread_id, exc)
         finally:
-            if page is not None:
+            if tab is not None:
                 try:
-                    await page.close()
+                    await tab.close()
                 except Exception:
                     pass
         return None
 
     async def _poll_video_result(
-        self, task_id: str, prompt: str, timeout: float = 300
+        self, task_id: str, prompt: str, timeout: float = 300,
+        page: Optional[Page] = None,
     ) -> Dict[str, Any]:
         """Poll /samantha/chat/completion with task_id for video result."""
         import base64
 
         poll_payload = {"task_id": task_id, "event_id": 0}
         # Use _samantha_request which now uses browser fetch
-        raw = await self._samantha_request(poll_payload, timeout=timeout)
+        raw = await self._samantha_request(poll_payload, timeout=timeout, page=page)
 
         videos = []
         for data in self._parse_samantha_sse(raw):
@@ -2456,6 +2565,9 @@ class BrowserClient:
     # ------------------------------------------------------------------
     # File upload (TOS / ImageX flow)
     # ------------------------------------------------------------------
+    # ponytail: upload_file / upload_image go through httpx (self._http);
+    # the only page dependency is _sign_url/_get_cookies_string, which work
+    # on any Doubao page. First version keeps uploads on the default page.
 
     async def upload_file(
         self,
@@ -2719,6 +2831,7 @@ class BrowserClient:
         file_name: str,
         file_size: int,
         use_deep_think: int = 0,
+        page: Optional[Page] = None,
     ) -> Dict[str, Any]:
         """Chat with a file attachment. The AI will read the file and answer.
 
@@ -2734,6 +2847,8 @@ class BrowserClient:
         """
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
+
+        pg = page or self._page
 
         msg_uuid = str(uuid.uuid4())
         local_conv_id = f"local_{uuid.uuid4().int % 10**16}"
@@ -2873,6 +2988,9 @@ class BrowserClient:
         query_params = self._build_query_params()
         query_string = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
         url = f"/chat/completion?{query_string}"
+        # ponytail: uploads sign on the default page; per-account signing when
+        # a cross-account upload ever fails (TOS files are URL-referenced, so
+        # they are shareable across accounts' sessions).
 
         # Use browser fetch (non-streaming, collect full response)
         js_code = """
@@ -2900,7 +3018,7 @@ class BrowserClient:
         """
         payload_json = json.dumps(payload, ensure_ascii=False)
         log.info("POST /chat/completion [chat_with_file, browser fetch]")
-        result = await self._page.evaluate(js_code, [url, payload_json])
+        result = await pg.evaluate(js_code, [url, payload_json])
 
         if result.get("error"):
             raise RuntimeError(

@@ -315,7 +315,7 @@ def test_browser_client_generate_video_attachments_payload():
         client = BrowserClient(headless=True)
         captured_payload = {}
 
-        async def fake_samantha_request(payload, timeout=60):
+        async def fake_samantha_request(payload, timeout=60, page=None):
             nonlocal captured_payload
             captured_payload = payload
             sse_event = {
@@ -335,7 +335,7 @@ def test_browser_client_generate_video_attachments_payload():
             ref_image_keys=["key_alpha", "key_beta"],
         )
         assert res["videos"][0]["video_url"] == "https://test.mp4"
-        client._poll_video_result.assert_called_once_with("task_123", "测试视频多图")
+        client._poll_video_result.assert_called_once_with("task_123", "测试视频多图", page=None)
         assert len(captured_payload["messages"]) == 1
         msg = captured_payload["messages"][0]
         assert msg["content_type"] == 2020
@@ -356,7 +356,7 @@ def test_browser_client_generate_image_attachments_payload():
         client = BrowserClient(headless=True)
         captured_payload = {}
 
-        async def fake_samantha_request(payload, timeout=60):
+        async def fake_samantha_request(payload, timeout=60, page=None):
             nonlocal captured_payload
             captured_payload = payload
             inner_content = json.dumps({
