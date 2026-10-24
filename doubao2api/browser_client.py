@@ -104,6 +104,23 @@ def resolve_memory_type(
     return 2
 
 
+_VIDEO_STARTED_HINTS = (
+    "预计等待",
+    "视频生成好后",
+    "本次使用",
+    "生成完毕",
+)
+
+
+def _video_generation_started(text: str) -> bool:
+    """Guess whether a video generation reply means the task has been accepted.
+
+    When Doubao answers with a parameter-confirmation question instead, the reply
+    carries no such hints and waiting for a result would be wasted time.
+    """
+    return any(hint in text for hint in _VIDEO_STARTED_HINTS)
+
+
 def bring_window_to_foreground():
     """Attempt to bring the browser window to the foreground on Windows."""
     if os.name != "nt":
@@ -1590,8 +1607,9 @@ class BrowserClient:
             raise RuntimeError("Browser not ready - need login first")
 
         query_params = self._build_query_params()
-        query_string = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
-        url = f"/samantha/chat/completion?{query_string}"
+        # Sign the URL like the chat endpoint does; unsigned requests are
+        # rejected by ByteDance risk control (710022004 / verify slider).
+        url = await self._sign_url("/samantha/chat/completion", query_params)
 
         js_code = """
         async ([url, payloadJson, timeoutMs]) => {
@@ -2023,6 +2041,13 @@ class BrowserClient:
         }
 
         eff_mem_type = resolve_memory_type(memory_type, save_history)
+        # Video results are delivered asynchronously into the conversation, so the
+        # conversation must be persisted in order to read the result afterwards.
+        # Ephemeral conversations (memory_type=2) never appear in thread/list.
+        if eff_mem_type == 2:
+            log.info("generate_video: forcing memory_type=0 (ephemeral conversations cannot deliver async video results)")
+            eff_mem_type = 0
+        pre_thread_ids = await self._list_recent_thread_ids()
         payload = {
             "messages": [message],
             "completion_option": {
@@ -2120,14 +2145,158 @@ class BrowserClient:
             raise RuntimeError("视频生成服务过载，请稍后重试")
 
         if not task_id:
-            # Maybe sync result with content_type=2021, or just text response
+            # Newer Doubao builds do not emit an async task_id for video: the
+            # completion returns a short "generating" text and the finished video
+            # is pushed into the conversation a few minutes later.
             if full_text:
+                if _video_generation_started(full_text):
+                    timeout = float(os.environ.get("DOUBAO_VIDEO_TIMEOUT", "420"))
+                    video = await self._wait_for_generated_video(pre_thread_ids, timeout=timeout)
+                    if video:
+                        return {
+                            "videos": [video],
+                            "prompt": prompt,
+                            "conversation_id": video.pop("_thread_id", ""),
+                        }
                 return {"videos": [], "prompt": prompt, "message": full_text}
             raise RuntimeError("Video generation: no task_id returned")
 
         # Phase 2: Poll for result
         log.info("generate_video: polling task_id=%s", task_id)
         return await self._poll_video_result(task_id, prompt)
+
+    async def _list_recent_thread_ids(self, count: int = 10) -> List[str]:
+        """Return recent conversation thread ids (newest first).
+
+        Used to detect the conversation created by a video request, because the
+        completion response itself no longer carries an async task id.
+        """
+        try:
+            threads = await self._thread_list(count)
+            return [str(t.get("thread_id_str") or t.get("thread_id") or "") for t in threads]
+        except Exception as exc:
+            log.debug("thread list failed: %s", exc)
+            return []
+
+    async def _thread_list(self, count: int = 10) -> List[Dict[str, Any]]:
+        """Call POST /samantha/thread/list with a signed URL."""
+        if not self._ready or self._page is None:
+            return []
+        query_params = self._build_query_params()
+        signed_url = await self._sign_url("/samantha/thread/list", query_params)
+        result = await self._page.evaluate(
+            """
+            async ([url, body]) => {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: body,
+                    credentials: 'include',
+                });
+                return {status: res.status, body: await res.text()};
+            }
+            """,
+            [signed_url, json.dumps({"count": count})],
+        )
+        if not result or result.get("status") != 200:
+            return []
+        data = json.loads(result.get("body") or "{}")
+        return (data.get("data") or {}).get("thread_list") or []
+
+    async def _wait_for_generated_video(
+        self, pre_thread_ids: List[str], timeout: float = 300
+    ) -> Optional[Dict[str, Any]]:
+        """Wait for the video of a freshly submitted task and return its URL.
+
+        Strategy: find the conversation created by the request, wait for the
+        conversation's message index to grow, then read the video element that
+        the page renders (its `currentSrc` is the playable/ downloadable URL).
+        """
+        deadline = time.time() + timeout
+        thread_id = ""
+        baseline_index = 0
+
+        while time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                threads = await self._thread_list(10)
+            except Exception:
+                continue
+            if not threads:
+                continue
+            newest = threads[0]
+            newest_id = str(newest.get("thread_id_str") or newest.get("thread_id") or "")
+            if not newest_id:
+                continue
+            if newest_id in pre_thread_ids:
+                continue  # conversation not created yet
+            conv = newest.get("conversation") or {}
+            thread_id = newest_id
+            idx = int(conv.get("message_index") or 0)
+            if baseline_index == 0:
+                baseline_index = idx
+            if idx <= baseline_index:
+                continue
+            # New messages landed — open the conversation and extract the video.
+            video = await self._extract_video_from_thread(thread_id)
+            if video:
+                log.info("Video ready in thread %s", thread_id)
+                video["_thread_id"] = thread_id
+                return video
+        log.warning("Timed out waiting for generated video (thread=%s)", thread_id)
+        return None
+
+    async def _extract_video_from_thread(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        """Open a conversation in a temporary tab and read the newest video URL.
+
+        A separate tab is used on purpose: navigating the main page would drop the
+        exposed ``__doubaoStreamChunk`` binding used by chat streaming.
+        """
+        if self._context is None:
+            return None
+        page = None
+        try:
+            page = await self._context.new_page()
+            await page.goto(
+                f"{DOUBAO_URL}/chat/{thread_id}",
+                wait_until="domcontentloaded",
+                timeout=45000,
+            )
+            await asyncio.sleep(4)
+            await page.evaluate(
+                """() => {
+                    document.querySelectorAll('.block-video-MzfWVN, [class*="block-video"]').forEach(el => {
+                        try { el.click(); } catch (e) {}
+                    });
+                }"""
+            )
+            await asyncio.sleep(3)
+            info = await page.evaluate(
+                """() => {
+                    const v = Array.from(document.querySelectorAll('video'))
+                        .map(x => x.currentSrc || x.src)
+                        .filter(Boolean);
+                    const img = document.querySelector('[class*="block-video"] img');
+                    return {video_url: v.length ? v[v.length - 1] : '', cover_url: img ? img.src : ''};
+                }"""
+            )
+            if isinstance(info, dict) and info.get("video_url"):
+                return {
+                    "video_url": info["video_url"],
+                    "cover_url": info.get("cover_url", ""),
+                    "width": 0,
+                    "height": 0,
+                    "duration": 0.0,
+                }
+        except Exception as exc:
+            log.warning("extract video from thread %s failed: %s", thread_id, exc)
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        return None
 
     async def _poll_video_result(
         self, task_id: str, prompt: str, timeout: float = 300

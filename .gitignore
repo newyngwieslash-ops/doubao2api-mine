@@ -32,6 +32,8 @@ testpic.webp
 .login_success
 scratch/
 data/
+.browser-data/
+.tmp/
 
 # OS
 Thumbs.db

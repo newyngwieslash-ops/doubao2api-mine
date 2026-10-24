@@ -1458,14 +1458,21 @@ def create_app(
 
         header_save = request.headers.get("x-save-history", "").lower() in ("true", "1", "yes")
         header_no_del = request.headers.get("x-auto-delete", "").lower() in ("false", "0", "no")
+        # Video results only exist inside the persisted conversation, so it is kept
+        # until the result has been read; this flag decides whether to delete it then.
+        ephemeral_conv = True
         if memory_type is not None:
             gen_kwargs["memory_type"] = memory_type
+            ephemeral_conv = int(memory_type) == 2
         elif save_history is not None:
             gen_kwargs["save_history"] = save_history
+            ephemeral_conv = not save_history
         elif header_save or header_no_del:
             gen_kwargs["save_history"] = True
+            ephemeral_conv = False
         elif not _auto_delete_conv:
             gen_kwargs["memory_type"] = 0
+            ephemeral_conv = False
 
         try:
             result = await client.generate_video(
@@ -1476,6 +1483,7 @@ def create_app(
 
         videos = result.get("videos", [])
         msg = result.get("message", "")
+        conversation_id = result.get("conversation_id", "")
         if not videos and msg:
             return JSONResponse({"created": int(time.time()), "data": [], "message": msg})
         if not videos:
@@ -1483,6 +1491,14 @@ def create_app(
 
         for vid in videos:
             _record_recent_media("video", vid.get("video_url", ""), prompt, cover_url=vid.get("cover_url", ""), model="doubao-video")
+
+        # Video results are read from the persisted conversation, so clean it up
+        # afterwards to honour the ephemeral ("即用即焚") setting.
+        if conversation_id and ephemeral_conv:
+            try:
+                await client.delete_conversation(conversation_id)
+            except Exception as exc:
+                log.warning("Failed to delete video conversation %s: %s", conversation_id, exc)
 
         return JSONResponse({
             "created": int(time.time()),

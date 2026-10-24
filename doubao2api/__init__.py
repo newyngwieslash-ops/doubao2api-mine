@@ -1,5 +1,9 @@
 __version__ = "0.2.0"
 
+from . import _runtime
+
+_runtime.apply()
+
 from .browser_client import BrowserClient
 from .captcha_handler import AutoCaptchaHandler, CaptchaHandler
 from .client import (
