@@ -106,3 +106,14 @@ def test_stream_survives_idle_gap_with_keepalive(monkeypatch):
     assert b": keep-alive" in body                 # heartbeat emitted
     assert b"first" in body and b"second" in body  # stream did NOT die after it
     assert b"[DONE]" in body
+
+
+def test_captcha_failover_only_calls_real_methods():
+    """Guard against phantom-method drift: unified_server once called
+    client.apply_account(), which never existed on BrowserClient — and the
+    old test mocked it, masking the bug behind a green test."""
+    for name in (
+        "switch_to_account", "try_auto_solve_captcha", "auto_popup_for_captcha",
+        "is_captcha_visible", "clear_captcha", "record_success",
+    ):
+        assert hasattr(BrowserClient, name), f"BrowserClient.{name} missing"

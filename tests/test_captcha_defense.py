@@ -123,7 +123,7 @@ def test_captcha_failover_in_chat_completions(tmp_path):
     # Captcha is visible, auto-solver fails
     mock_client.is_captcha_visible = AsyncMock(return_value=True)
     mock_client.try_auto_solve_captcha = AsyncMock(return_value=False)
-    mock_client.apply_account = AsyncMock(return_value=True)
+    mock_client.switch_to_account = AsyncMock(return_value=True)
     mock_client.extract_conversation_id = MagicMock(return_value="c_test")
 
     # Mock chat completion stream
@@ -144,5 +144,5 @@ def test_captcha_failover_in_chat_completions(tmp_path):
     assert resp.status_code == 200
     # acc1 was marked as captcha
     assert am.get_account(acc1.id).status == "captcha"
-    # apply_account was called with acc2
-    mock_client.apply_account.assert_called_once_with(acc2)
+    # switch_to_account was called with acc2's id
+    mock_client.switch_to_account.assert_called_once_with(acc2.id)

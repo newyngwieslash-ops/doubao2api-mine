@@ -930,10 +930,11 @@ def create_app(
                     next_acc.id,
                     next_acc.name,
                 )
-                await client.apply_account(next_acc)
-                client.clear_captcha()
-                client._ready = True
-                return
+                ok = await client.switch_to_account(next_acc.id)
+                if ok:
+                    client.clear_captcha()
+                    return
+                log.error("Failover to account %s failed; falling back to manual captcha", next_acc.id)
 
         # Tier 4: Fallback - popup desktop window and raise 503
         popped = await client.auto_popup_for_captcha()
