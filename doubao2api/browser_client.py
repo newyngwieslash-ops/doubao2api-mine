@@ -210,6 +210,8 @@ class BrowserClient:
         # Per-account service contexts: account_id -> {"context", "page"}
         # Lazy: created on first routed request, capped by DOUBAO_POOL_SIZE.
         self._svc: Dict[str, dict] = {}
+        # Per-account creation locks: concurrent acquires must not each build a context
+        self._svc_locks: Dict[str, asyncio.Lock] = {}
         self._pool_size = max(1, int(os.environ.get("DOUBAO_POOL_SIZE", "1")))
         # Stream bridge: request_id -> asyncio.Queue for SSE chunks
         self._stream_queues: Dict[str, asyncio.Queue] = {}
@@ -1071,35 +1073,43 @@ class BrowserClient:
         if s and not s["page"].is_closed():
             return s["page"]
 
-        # Enforce pool size by evicting the least-recently-used entry
-        while len(self._svc) >= self._pool_size:
-            lru_id = next(iter(self._svc))
-            if lru_id == acc.id and len(self._svc) == 1:
-                break
-            self.release_service_context(lru_id)
+        # One creation per account: concurrent requests would otherwise both
+        # see a cache miss and each build a context, leaking the loser.
+        lock = self._svc_locks.setdefault(acc.id, asyncio.Lock())
+        async with lock:
+            s = self._svc.get(acc.id)
+            if s and not s["page"].is_closed():
+                return s["page"]
 
-        ctx = None
-        try:
-            ctx = await self._context.browser.new_context(
-                viewport={"width": 1280, "height": 720}, locale="zh-CN",
-            )
-            await ctx.add_cookies(self._to_playwright_cookies(acc.cookies))
-            page = await ctx.new_page()
-            await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=45000)
-            await self._setup_fetch_bridge(page)
-            await self._wait_for_signing(page)
-            self._svc[acc.id] = {"context": ctx, "page": page}
-            log.info("Service context ready for account %s (%s), pool=%d/%d",
-                     acc.id, acc.name, len(self._svc), self._pool_size)
-            return page
-        except Exception as e:
-            log.error("acquire_service_page failed for %s: %s", acc.id, e)
-            if ctx is not None:
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
-            return None
+            # Enforce pool size by evicting the least-recently-used entry
+            while len(self._svc) >= self._pool_size:
+                lru_id = next(iter(self._svc))
+                if lru_id == acc.id and len(self._svc) == 1:
+                    break
+                self.release_service_context(lru_id)
+
+            ctx = None
+            try:
+                ctx = await self._context.browser.new_context(
+                    viewport={"width": 1280, "height": 720}, locale="zh-CN",
+                )
+                await ctx.add_cookies(self._to_playwright_cookies(acc.cookies))
+                page = await ctx.new_page()
+                await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=45000)
+                await self._setup_fetch_bridge(page)
+                await self._wait_for_signing(page)
+                self._svc[acc.id] = {"context": ctx, "page": page}
+                log.info("Service context ready for account %s (%s), pool=%d/%d",
+                         acc.id, acc.name, len(self._svc), self._pool_size)
+                return page
+            except Exception as e:
+                log.error("acquire_service_page failed for %s: %s", acc.id, e)
+                if ctx is not None:
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
+                return None
 
     def release_service_context(self, account_id: str) -> None:
         """Close and evict an account's service context (captcha / invalid cookie)."""

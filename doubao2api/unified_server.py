@@ -2332,7 +2332,43 @@ def create_app(
                 "audio": ["doubao-music"],
             },
             "auto_delete_conv": _auto_delete_conv,
+            "pool_size": int(os.environ.get("DOUBAO_POOL_SIZE", "1")),
         })
+
+    @app.get("/admin/api/config/pool-size")
+    async def admin_get_pool_size(request: Request):
+        """Current service-context pool size (1 = single-page rotation mode)."""
+        _check_auth(request)
+        return JSONResponse({"pool_size": int(os.environ.get("DOUBAO_POOL_SIZE", "1"))})
+
+    @app.post("/admin/api/config/pool-size")
+    async def admin_set_pool_size(request: Request):
+        """Set the per-account service-context pool size at runtime.
+
+        No restart needed: the routing gate reads DOUBAO_POOL_SIZE on every
+        request, and the cap is mirrored onto the live client. Shrinking below
+        the in-use count lets the existing LRU eviction reclaim contexts on the
+        next acquire.
+        """
+        _check_auth(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            value = int(body.get("pool_size"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="pool_size must be an integer")
+        if not 1 <= value <= 16:
+            raise HTTPException(status_code=400, detail="pool_size must be between 1 and 16")
+
+        os.environ["DOUBAO_POOL_SIZE"] = str(value)
+        client = _browser.get("client")
+        if client is not None and hasattr(client, "_pool_size"):
+            client._pool_size = value
+        log.info("Runtime pool_size set to %d (mode: %s)", value,
+                 "single-page rotation" if value == 1 else "parallel contexts")
+        return JSONResponse({"status": "ok", "pool_size": value})
 
     @app.post("/admin/api/config/auto-delete")
     async def admin_toggle_auto_delete(request: Request):

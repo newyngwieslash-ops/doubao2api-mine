@@ -727,3 +727,93 @@ def test_svc_account_id_for_page_lookup():
     assert bc._svc_account_id_for_page(page_a) == "a"
     assert bc._svc_account_id_for_page(page_b) == "b"
     assert bc._svc_account_id_for_page(MagicMock()) is None  # unknown page
+
+
+def test_pool_size_endpoint_reads_and_sets_runtime(monkeypatch):
+    """POOL_SIZE must be a runtime switch: the routing gate reads
+    os.environ at each request, so no restart is needed."""
+    import os
+    from fastapi.testclient import TestClient
+    from doubao2api.unified_server import create_app
+
+    monkeypatch.setenv("DOUBAO_POOL_SIZE", "1")
+    client = MagicMock()
+    client._pool_size = 1
+    tc = TestClient(create_app(browser_client=client))
+
+    r = tc.get("/admin/api/config/pool-size")
+    assert r.status_code == 200
+    assert r.json()["pool_size"] == 1
+
+    r = tc.post("/admin/api/config/pool-size", json={"pool_size": 2})
+    assert r.status_code == 200
+    assert r.json()["pool_size"] == 2
+    assert os.environ["DOUBAO_POOL_SIZE"] == "2"   # routing gate sees it immediately
+    assert client._pool_size == 2                  # context pool cap follows
+
+    # invalid values are rejected, state unchanged
+    assert tc.post("/admin/api/config/pool-size", json={"pool_size": 0}).status_code == 400
+    assert tc.post("/admin/api/config/pool-size", json={"pool_size": "x"}).status_code == 400
+    assert os.environ["DOUBAO_POOL_SIZE"] == "2"
+
+
+def test_acquire_is_single_flight_per_account():
+    """Two concurrent acquires for the same account must create ONE context.
+    Before the per-account lock they both saw a cache miss and each built a
+    context, leaking the loser (observed live: two 'pool=1/2' log lines)."""
+    bc = _bc()
+    created = []
+
+    class FakeCtx:
+        def __init__(self):
+            self.page = MagicMock()
+            self.page.is_closed = lambda: False
+            self.page.goto = AsyncMock(return_value=None)
+
+        async def add_cookies(self, c):
+            pass
+
+        async def new_page(self):
+            return self.page
+
+        async def close(self):
+            pass
+
+    class FakeBrowser:
+        async def new_context(self, **kw):
+            await asyncio.sleep(0.05)     # widen the race window
+            ctx = FakeCtx()
+            created.append(ctx)
+            return ctx
+
+    bc._context = MagicMock()
+    bc._context.browser = FakeBrowser()
+    bc._pool_size = 2
+
+    async def fake_goto(url, **kw):
+        await asyncio.sleep(0.05)
+
+    async def fake_bridge(page=None):
+        return None
+
+    async def fake_signing(page=None):
+        return None
+
+    bc._setup_fetch_bridge = fake_bridge
+    bc._wait_for_signing = fake_signing
+
+    acc = MagicMock()
+    acc.id = "a1"
+    acc.name = "acc1"
+    acc.cookies = {"sessionid": "s1"}
+
+    async def scenario():
+        p1, p2 = await asyncio.gather(
+            bc.acquire_service_page(acc),
+            bc.acquire_service_page(acc),
+        )
+        return p1, p2
+
+    p1, p2 = asyncio.run(scenario())
+    assert len(created) == 1, f"expected 1 context, got {len(created)} (leak)"
+    assert p1 is p2

@@ -654,6 +654,23 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:#6366f1;box-sh
           </div>
         </div>
 
+        <!-- Concurrency Mode (runtime pool size) -->
+        <div class="flex items-center justify-between p-3.5 bg-surface-900/60 rounded-xl border border-slate-800 text-xs">
+          <div class="flex items-center gap-2">
+            <span class="text-slate-400 font-medium">并发模式：</span>
+            <span class="text-slate-300">{{concurrencyModeText}}</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <select :value="poolSize" @change="setPoolSize($event.target.value)" :disabled="poolSizeLoading"
+              class="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-200 border border-slate-700 text-xs font-medium cursor-pointer disabled:opacity-50">
+              <option v-for="n in [1,2,3,4]" :key="n" :value="n">
+                {{ n === 1 ? '1 · 单页轮换' : n + ' 路并行' }}
+              </option>
+            </select>
+            <span v-if="poolSizeLoading" class="text-slate-500">⏳</span>
+          </div>
+        </div>
+
         <!-- Strategy Selector -->
         <div class="flex items-center justify-between p-3.5 bg-surface-900/60 rounded-xl border border-slate-800 text-xs">
           <div class="flex items-center gap-2">
@@ -1012,6 +1029,40 @@ createApp({
     const newAccount = reactive({ name: '', cookies: '' });
     const newAccountLoading = ref(false);
     const newAccountError = ref('');
+    // Concurrency mode: 1 = single-page rotation, >1 = parallel service contexts
+    const poolSize = ref(1);
+    const poolSizeLoading = ref(false);
+    const concurrencyModeText = computed(() => poolSize.value === 1
+      ? '单页轮换（请求串行，切号需排空在途流）'
+      : `并行 ${poolSize.value} 路（每账号独立 context，风控零成本逃生）`);
+
+    async function fetchPoolSize(){
+      try{
+        const d = await api('/admin/api/config/pool-size');
+        poolSize.value = d.pool_size || 1;
+      }catch(e){}
+    }
+
+    async function setPoolSize(val){
+      const target = parseInt(val, 10);
+      if(!target || target === poolSize.value) return;
+      poolSizeLoading.value = true;
+      try{
+        const r = await api('/admin/api/config/pool-size', {
+          method: 'POST',
+          body: JSON.stringify({ pool_size: target })
+        });
+        poolSize.value = r.pool_size;
+        if(target > accounts.value.length){
+          alert(`已切换为 ${target} 路并行，但账号池只有 ${accounts.value.length} 个账号。\n超出的并发位会复用已有账号，建议先导入更多账号。`);
+        }
+      }catch(e){
+        alert('切换并发模式失败: ' + e.message);
+        await fetchPoolSize();
+      }finally{
+        poolSizeLoading.value = false;
+      }
+    }
 
     async function fetchAccounts(){
       try{
@@ -1022,6 +1073,7 @@ createApp({
       }catch(e){
         console.error('fetchAccounts error:', e);
       }
+      await fetchPoolSize();
     }
 
     async function switchAccount(id){
@@ -1618,6 +1670,7 @@ createApp({
       installChromium, installingChromium, toggleAutoDelete,
       // Multi-account pool
       accounts, accountStrategy, activeAccountId, accountActionLoading,
+      poolSize, poolSizeLoading, concurrencyModeText, fetchPoolSize, setPoolSize,
       showAddAccountModal, newAccount, newAccountLoading, newAccountError,
       fetchAccounts, switchAccount, saveCurrentAsAccount, addAccount,
       deleteAccount, resetQuota, setStrategy,
