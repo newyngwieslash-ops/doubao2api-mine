@@ -209,7 +209,8 @@ class BrowserClient:
         self._active_streams = 0
         # Stream bridge: request_id -> asyncio.Queue for SSE chunks
         self._stream_queues: Dict[str, asyncio.Queue] = {}
-        self._bridge_ready: bool = False
+        # Fetch-bridge registration is per-context; track which pages have it
+        self._bridged_pages: set = set()
         self._user_agent: str = ""
         self._browser_name: str = "Chromium"
 
@@ -651,7 +652,8 @@ class BrowserClient:
         self._playwright = None
         self._page = None
         self._ready = False
-        self._bridge_ready = False
+        # All pages (and their contexts) are gone; drop bridge registrations
+        self._bridged_pages.clear()
         # Clean stale browser lock files if any were left behind
         if self.user_data_dir and os.path.exists(self.user_data_dir):
             for lock_name in ("lockfile", "SingletonLock", "SingletonSocket", "SingletonCookie"):
@@ -815,7 +817,7 @@ class BrowserClient:
         await self._setup_fetch_bridge()
         await self._verify_fetch_hook()
         await self._wait_for_signing()  # still needed for upload endpoints
-        log.info("Ready! device_id=%s, fetch_hook=%s", self._device_id, self._bridge_ready)
+        log.info("Ready! device_id=%s, fetch_hook=%s", self._device_id, self._page in self._bridged_pages if self._page else False)
 
         # Auto-register default account into account_manager if pool is empty
         if hasattr(self, "account_manager") and len(self.account_manager.accounts) == 0:
@@ -873,29 +875,42 @@ class BrowserClient:
             await asyncio.sleep(5)
         log.warning("bdms.frontierSign not available after 60s - signing may fail")
 
-    async def _setup_fetch_bridge(self):
-        """Register expose_function callback for streaming data from browser to Python."""
-        if self._bridge_ready:
+    async def _on_stream_chunk(self, request_id: str, chunk_json: str):
+        """Called from browser JS for each SSE chunk or completion signal (any context)."""
+        queue = self._stream_queues.get(request_id)
+        if queue:
+            await queue.put(chunk_json)
+
+    async def _setup_fetch_bridge(self, page: Optional[Page] = None) -> None:
+        """Register the stream-chunk callback on the page's context.
+
+        expose_function is context-scoped: every new context must register its
+        own bridge. The callback routes by request_id, so one Python-side
+        router serves all pages/contexts.
+        """
+        page = page or self._page
+        if not page:
             return
-
-        async def _on_stream_chunk(request_id: str, chunk_json: str):
-            """Called from browser JS for each SSE chunk or completion signal."""
-            queue = self._stream_queues.get(request_id)
-            if queue:
-                await queue.put(chunk_json)
-
-        try:
-            await self._page.expose_function("__doubaoStreamChunk", _on_stream_chunk)
-            self._bridge_ready = True
-            log.info("Fetch bridge registered (expose_function ready)")
-        except Exception as e:
-            # May already be registered if page didn't navigate
-            if "already been registered" in str(e).lower():
-                self._bridge_ready = True
-                log.info("Fetch bridge already registered")
-            else:
-                log.error("Failed to register fetch bridge: %s", e)
-                raise
+        # ponytail: track registered pages on a set; per-page registration is
+        # idempotent via this set — escalate to per-context sets if pages get
+        # replaced inside a context at runtime.
+        if page not in self._bridged_pages:
+            try:
+                await page.expose_function("__doubaoStreamChunk", self._on_stream_chunk)
+                self._bridged_pages.add(page)
+                try:
+                    page_url = page.url if not page.is_closed() else "?"
+                except Exception:
+                    page_url = "?"
+                log.info("Fetch bridge registered (page=%s)", page_url)
+            except Exception as e:
+                # May already be registered if page didn't navigate
+                if "already been registered" in str(e).lower():
+                    self._bridged_pages.add(page)
+                    log.info("Fetch bridge already registered on page")
+                else:
+                    log.error("Failed to register fetch bridge: %s", e)
+                    raise
 
     async def _verify_fetch_hook(self):
         """Verify ByteDance's fetch interceptor is active (adds a_bogus)."""
@@ -1408,9 +1423,10 @@ class BrowserClient:
                     pass
 
     async def _browser_fetch_stream(
-        self, url: str, payload: Dict[str, Any], request_id: str
+        self, url: str, payload: Dict[str, Any], request_id: str,
+        page: Optional[Page] = None,
     ):
-        """Execute fetch() inside browser page and stream SSE chunks via callback."""
+        """Execute fetch() inside the given page and stream SSE chunks via callback."""
         js_code = """
         async ([url, payloadJson, requestId]) => {
             const sendChunk = async (chunk) => {
@@ -1495,7 +1511,8 @@ class BrowserClient:
         }
         """
         payload_json = json.dumps(payload, ensure_ascii=False)
-        await self._page.evaluate(js_code, [url, payload_json, request_id])
+        # 缺省回退默认页；显式 page 时在该页（其所属 context）内执行 fetch
+        await (page or self._page).evaluate(js_code, [url, payload_json, request_id])
 
     # ------------------------------------------------------------------
     # High-level chat helper
