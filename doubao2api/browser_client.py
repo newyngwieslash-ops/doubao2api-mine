@@ -1123,6 +1123,19 @@ class BrowserClient:
             pass
         log.info("Service context released for account %s", account_id)
 
+    def _svc_account_id_for_page(self, page: Optional[Page]) -> Optional[str]:
+        """Reverse-lookup which pool account a service page belongs to.
+
+        Returns None for the default page (page=None) or an unknown page —
+        callers then fall back to legacy active-account semantics.
+        """
+        if page is None:
+            return None
+        for acc_id, s in self._svc.items():
+            if s.get("page") is page:
+                return acc_id
+        return None
+
     # ------------------------------------------------------------------
     # Signing & Cookies
     # ------------------------------------------------------------------
@@ -2269,6 +2282,15 @@ class BrowserClient:
                 detail = data.get("event_data", "")
                 is_quota = any(k in str(detail) for k in ("今日生成次数已达上限", "次数已达上限", "额度已用尽", "达到今日上限", "次数超限"))
                 if is_quota and hasattr(self, "account_manager"):
+                    # 池模式（显式 page）：配额错误只标记路由账号（由 _svc 反查），
+                    # 绝不走 switch_to_account 递归——它会 reload 默认页（炸掉整个
+                    # 池），且换号后的请求仍跑在旧账号的服务页上（必再错）。
+                    # ponytail: 池化视频配额失败转移归端点/路由层负责（释放本账号
+                    # context、换号重试一次）；此处返回带「配额+账号」标记的错误。
+                    quota_acc_id = self._svc_account_id_for_page(page)
+                    if quota_acc_id:
+                        self.account_manager.mark_quota_exceeded(quota_acc_id, feature="video")
+                        raise RuntimeError(f"generate_video quota exceeded (pool account {quota_acc_id}): {str(detail)[:400]}")
                     self.account_manager.mark_quota_exceeded(feature="video")
                     if self.account_manager.has_alternative_accounts("video"):
                         next_acc = self.account_manager.get_next_available_account("video")
@@ -2320,6 +2342,11 @@ class BrowserClient:
         full_text = "".join(text_parts)
         is_quota = any(k in full_text for k in ("今日生成次数已达上限", "次数已达上限", "额度已用尽", "达到今日上限", "次数超限"))
         if is_quota and hasattr(self, "account_manager"):
+            # 池模式同上：只标记路由账号并让错误上抛，禁止 switch_to_account 递归
+            quota_acc_id = self._svc_account_id_for_page(page)
+            if quota_acc_id:
+                self.account_manager.mark_quota_exceeded(quota_acc_id, feature="video")
+                raise RuntimeError(f"generate_video quota exceeded (pool account {quota_acc_id}): {full_text[:400]}")
             self.account_manager.mark_quota_exceeded(feature="video")
             if self.account_manager.has_alternative_accounts("video"):
                 next_acc = self.account_manager.get_next_available_account("video")
