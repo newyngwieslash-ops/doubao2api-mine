@@ -962,6 +962,9 @@ def create_app(
             # Convert messages with tool definitions injected
             messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
             prompt = convert_messages_with_tools(messages_raw, body.tools)
+            # Attach images/files sent alongside tool requests (Cline/Continue
+            # screenshots); the text prompt itself is built above.
+            _, file_refs, image_refs = _extract_prompt_and_file_refs(body.messages)
         else:
             requested_model = (body.model or "").strip()
             target_model = requested_model
