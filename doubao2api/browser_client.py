@@ -13,6 +13,8 @@ and call this signing function. All actual API traffic goes through httpx.
 """
 
 import asyncio
+import functools
+import inspect
 import json
 import logging
 import os
@@ -121,6 +123,33 @@ def _video_generation_started(text: str) -> bool:
     return any(hint in text for hint in _VIDEO_STARTED_HINTS)
 
 
+def _tracks_page_stream(func):
+    """Count in-flight long page streams so account switching can drain first.
+
+    ponytail: one shared page — a reload kills every in-flight fetch on it, so
+    we serialize instead. True parallel accounts need one BrowserContext each.
+    """
+    if inspect.isasyncgenfunction(func):
+        @functools.wraps(func)
+        async def gen_wrapper(self, *args, **kwargs):
+            self._begin_stream()
+            try:
+                async for item in func(self, *args, **kwargs):
+                    yield item
+            finally:
+                self._end_stream()
+        return gen_wrapper
+
+    @functools.wraps(func)
+    async def call_wrapper(self, *args, **kwargs):
+        self._begin_stream()
+        try:
+            return await func(self, *args, **kwargs)
+        finally:
+            self._end_stream()
+    return call_wrapper
+
+
 def bring_window_to_foreground():
     """Attempt to bring the browser window to the foreground on Windows."""
     if os.name != "nt":
@@ -176,6 +205,8 @@ class BrowserClient:
         self._last_error_code: int = 0
         self._needs_captcha: bool = False
         self._mode_lock: asyncio.Lock = asyncio.Lock()
+        # In-flight long page streams; switch_to_account drains them before reload
+        self._active_streams = 0
         # Stream bridge: request_id -> asyncio.Queue for SSE chunks
         self._stream_queues: Dict[str, asyncio.Queue] = {}
         self._bridge_ready: bool = False
@@ -647,6 +678,29 @@ class BrowserClient:
             log.warning("Browser health check failed: %s", e)
             return False
 
+    def _begin_stream(self) -> None:
+        self._active_streams += 1
+
+    def _end_stream(self) -> None:
+        self._active_streams = max(0, self._active_streams - 1)
+
+    async def drain_streams(self, timeout: Optional[float] = None) -> None:
+        """Wait for in-flight streams before a page reload/restart.
+
+        Proceeds after `timeout` seconds even if streams remain: a stuck stream
+        must not block captcha failover forever. Default DOUBAO_DRAIN_TIMEOUT.
+        """
+        if timeout is None:
+            timeout = float(os.environ.get("DOUBAO_DRAIN_TIMEOUT", "150"))
+        deadline = time.monotonic() + timeout
+        while self._active_streams > 0 and time.monotonic() < deadline:
+            await asyncio.sleep(1)
+        if self._active_streams > 0:
+            log.warning(
+                "drain_streams: %d stream(s) still in flight after %.0fs; proceeding with reload",
+                self._active_streams, timeout,
+            )
+
     async def restart(self):
         """Stop and restart the browser client."""
         log.info("Restarting BrowserClient...")
@@ -952,6 +1006,9 @@ class BrowserClient:
         if not self._context or not self._page:
             return False
 
+        # Wait for in-flight streams: clear_cookies + reload would kill them all
+        await self.drain_streams()
+
         # Clear existing cookies to avoid session cross-contamination
         try:
             await self._context.clear_cookies()
@@ -1084,6 +1141,7 @@ class BrowserClient:
     # Chat Completion (streaming via in-browser fetch)
     # ------------------------------------------------------------------
 
+    @_tracks_page_stream
     async def chat_completion(
         self,
         text: str,
@@ -1692,6 +1750,7 @@ class BrowserClient:
                 continue
         return events
 
+    @_tracks_page_stream
     async def generate_image(
         self,
         prompt: str,
@@ -1826,6 +1885,7 @@ class BrowserClient:
         log.info("generate_image: got %d images", len(images))
         return {"images": images, "prompt": prompt}
 
+    @_tracks_page_stream
     async def generate_music(
         self,
         prompt: str,
@@ -1987,6 +2047,7 @@ class BrowserClient:
         log.info("generate_music: got %d tracks", len(tracks))
         return {"tracks": tracks, "prompt": prompt}
 
+    @_tracks_page_stream
     async def generate_video(
         self,
         prompt: str,

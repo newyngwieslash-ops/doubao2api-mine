@@ -117,3 +117,93 @@ def test_captcha_failover_only_calls_real_methods():
         "is_captcha_visible", "clear_captcha", "record_success",
     ):
         assert hasattr(BrowserClient, name), f"BrowserClient.{name} missing"
+
+
+def test_drain_streams_waits_then_returns_when_idle():
+    bc = BrowserClient(headless="true")
+
+    async def scenario():
+        bc._active_streams = 1
+        t0 = time.monotonic()
+        await bc.drain_streams(timeout=0.3)
+        assert time.monotonic() - t0 >= 0.3      # waited for the in-flight stream
+
+        bc._active_streams = 0
+        t0 = time.monotonic()
+        await bc.drain_streams(timeout=5)
+        assert time.monotonic() - t0 < 1         # idle -> returns immediately
+
+    asyncio.run(scenario())
+
+
+def test_tracks_page_stream_counts_inflight():
+    from doubao2api.browser_client import _tracks_page_stream
+
+    class Probe:
+        def __init__(self):
+            self.count = 0
+
+        def _begin_stream(self):
+            self.count += 1
+
+        def _end_stream(self):
+            self.count -= 1
+
+        @_tracks_page_stream
+        async def agen(self):
+            yield "a"
+            yield "b"
+
+        @_tracks_page_stream
+        async def coro(self):
+            return 42
+
+    p = Probe()
+
+    async def scenario():
+        it = p.agen()
+        assert await it.__anext__() == "a"
+        assert p.count == 1                      # counted while being consumed
+        assert await it.__anext__() == "b"
+        assert p.count == 1
+        try:
+            await it.__anext__()
+            assert False, "expected StopAsyncIteration"
+        except StopAsyncIteration:
+            pass
+        assert p.count == 0                      # released after exhaustion
+        assert await p.coro() == 42
+        assert p.count == 0                      # released after return
+
+    asyncio.run(scenario())
+
+
+def test_switch_to_account_drains_before_reload(tmp_path, monkeypatch):
+    bc = BrowserClient(headless="true", user_data_dir=str(tmp_path))
+    acc = bc.account_manager.add_or_update_account("acc", {"sessionid": "x"})
+
+    called = []
+
+    async def fake_drain(timeout=None):
+        called.append("drain")
+
+    async def fake_restart():
+        called.append("restart")
+
+    async def fake_inject(cookies):
+        called.append("inject")
+        return True
+
+    async def fake_alive():
+        return True
+
+    monkeypatch.setattr(bc, "drain_streams", fake_drain)
+    monkeypatch.setattr(bc, "restart", fake_restart)
+    monkeypatch.setattr(bc, "inject_cookies_and_reload", fake_inject)
+    monkeypatch.setattr(bc, "is_alive", fake_alive)
+    bc._context = object()  # truthy: skip the restart branch
+    bc._page = object()
+
+    ok = asyncio.run(bc.switch_to_account(acc.id))
+    assert ok is True
+    assert called == ["drain", "inject"]         # drain happens BEFORE any reload
