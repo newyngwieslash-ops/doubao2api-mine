@@ -860,10 +860,11 @@ class BrowserClient:
         log.info("Params: device_id=%s, web_id=%s, fp=%s",
                  self._device_id, self._web_id, self._fp[:20] if self._fp else "")
 
-    async def _wait_for_signing(self):
+    async def _wait_for_signing(self, page: Optional[Page] = None):
         """Wait for bdms.frontierSign to become available (legacy, kept for upload signing)."""
+        page = page or self._page
         for i in range(12):  # up to 60s
-            has_sign = await self._page.evaluate(
+            has_sign = await page.evaluate(
                 "() => typeof window.bdms?.frontierSign === 'function'"
             )
             if has_sign:
@@ -1049,15 +1050,16 @@ class BrowserClient:
                 return
         log.warning("No msToken cookie found - first request may trigger rate limit")
 
-    async def _sign_url(self, base_url: str, params: Dict[str, str]) -> str:
+    async def _sign_url(self, base_url: str, params: Dict[str, str], page: Optional[Page] = None) -> str:
         """Sign a URL using bdms.frontierSign with retry on failure."""
+        page = page or self._page
         sorted_params = dict(sorted(params.items()))
         query_string = urlencode(sorted_params)
 
         last_error = None
         for attempt in range(3):
             try:
-                sig = await self._page.evaluate(
+                sig = await page.evaluate(
                     f'window.bdms.frontierSign("{query_string}")'
                 )
 
