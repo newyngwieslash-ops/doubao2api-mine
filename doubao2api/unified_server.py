@@ -105,6 +105,9 @@ _dispatch_lock = asyncio.Lock()
 _last_dispatch_time: float = 0.0
 _MIN_DISPATCH_INTERVAL = float(os.environ.get("DOUBAO_MIN_INTERVAL", "0.2"))  # 200ms
 
+# ── SSE keepalive interval (idle gap before emitting a comment frame) ──
+_KEEPALIVE_INTERVAL = float(os.environ.get("DOUBAO_KEEPALIVE_INTERVAL", "5"))
+
 # ── Model definitions & Aliases ──────────────────────────────
 
 CHAT_MODELS: Dict[str, int] = {
@@ -1836,6 +1839,7 @@ def create_app(
             if isinstance(dc, dict):
                 yield from dc.get("content_block", [])
 
+        next_event: Optional[asyncio.Task] = None
         try:
             event_iter = client.chat_completion(
                 prompt, use_deep_think=use_deep_think,
@@ -1846,14 +1850,19 @@ def create_app(
             ).__aiter__()
 
             while True:
-                try:
-                    event = await asyncio.wait_for(event_iter.__anext__(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    # Emit SSE comment frame to keep connection alive through intermediate proxies
+                if next_event is None:
+                    next_event = asyncio.ensure_future(event_iter.__anext__())
+                done, _pending = await asyncio.wait({next_event}, timeout=_KEEPALIVE_INTERVAL)
+                if not done:
+                    # Keepalive must NOT use asyncio.wait_for: cancelling __anext__()
+                    # closes the async generator and the stream ends at the first idle gap.
                     yield ": keep-alive\n\n"
                     continue
+                try:
+                    event = next_event.result()
                 except StopAsyncIteration:
                     break
+                next_event = None
 
                 if event.get("error"):
                     chunk = _make_chunk(
@@ -2098,6 +2107,9 @@ def create_app(
             log.error("Stream error: %s", exc)
             chunk = _make_chunk({"content": f"[Error: {exc}]"})
             yield f"data: {json.dumps(chunk)}\n\n"
+        finally:
+            if next_event is not None:
+                next_event.cancel()
 
         # Flush any remaining tool buffer
         if tool_buffer:

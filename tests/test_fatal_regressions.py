@@ -77,3 +77,32 @@ def test_tools_request_with_image_passes_attachments_through():
     assert resp.status_code == 200, resp.text
     atts = captured["kwargs"].get("image_attachments")
     assert atts and len(atts) == 1
+
+
+def test_stream_survives_idle_gap_with_keepalive(monkeypatch):
+    """asyncio.wait_for(__anext__, timeout) cancels and CLOSES the async
+    generator on the first idle gap: the client got one keepalive comment,
+    then the stream died. asyncio.wait() must be used instead."""
+    import doubao2api.unified_server as us
+    monkeypatch.setattr(us, "_KEEPALIVE_INTERVAL", 0.2)
+
+    m = _mock_client()
+
+    async def slow_chat(*args, **kwargs):
+        yield {"_event": "CHUNK_DELTA", "text": "first"}
+        await asyncio.sleep(0.6)  # idle gap longer than the keepalive interval
+        yield {"_event": "CHUNK_DELTA", "text": "second"}
+
+    m.chat_completion = slow_chat
+    tc = TestClient(create_app(browser_client=m))
+    with tc.stream("POST", "/v1/chat/completions", json={
+        "model": "doubao-2.1-turbo",
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }) as resp:
+        assert resp.status_code == 200
+        body = b"".join(resp.iter_bytes())
+
+    assert b": keep-alive" in body                 # heartbeat emitted
+    assert b"first" in body and b"second" in body  # stream did NOT die after it
+    assert b"[DONE]" in body
