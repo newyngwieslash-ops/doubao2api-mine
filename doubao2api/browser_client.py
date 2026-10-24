@@ -503,6 +503,12 @@ class BrowserClient:
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
+            # Headless-service memory trim; rendering quality is irrelevant here.
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-features=MediaRouter,Translate,back-forward-cache",
+            # ponytail: render-heap cap; raise if doubao pages ever OOM.
+            "--js-flags=--max-old-space-size=256",
         ]
 
         launch_kwargs = {

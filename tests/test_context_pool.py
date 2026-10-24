@@ -422,3 +422,12 @@ def test_captcha_failover_releases_service_context_no_reload(tmp_path, monkeypat
     assert am.get_account(acc1.id).status == "captcha"
     m.release_service_context.assert_called_once_with(acc1.id)
     m.switch_to_account.assert_not_called()      # no reload, no stream kill
+
+
+def test_launch_args_contain_memory_flags():
+    import doubao2api.browser_client as bcmod
+    src = open(bcmod.__file__, encoding="utf-8").read()
+    assert '"--disable-gpu"' in src
+    assert '"--disable-dev-shm-usage"' in src
+    assert '"--js-flags=--max-old-space-size=256"' in src
+    assert '"--disable-features=MediaRouter,Translate' in src
