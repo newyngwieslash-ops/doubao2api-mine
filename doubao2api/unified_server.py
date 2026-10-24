@@ -214,6 +214,39 @@ def _record_recent_media(media_type: str, url: str, prompt: str, cover_url: str 
     })
 
 
+# ── Runtime config persistence ───────────────────────────────
+def _persist_env(key: str, value: str) -> None:
+    """Write a KEY=VALUE back into the project's .env so a UI change survives restart.
+
+    Rewrites only that one line (keeps comments and ordering); appends when the
+    key is absent. Best-effort: a read-only or missing .env must never break the
+    in-memory setting that was already applied.
+    """
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    try:
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        replaced = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("#") or "=" not in stripped:
+                continue
+            if stripped.split("=", 1)[0].strip() == key:
+                lines[i] = f"{key}={value}\n"
+                replaced = True
+                break
+        if not replaced:
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append(f"{key}={value}\n")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as exc:
+        log.warning("Could not persist %s=%s to .env: %s", key, value, exc)
+
+
 # ── Expert Mode Quota Tracker ──
 class ExpertQuotaTracker:
     """Detects when expert mode is silently downgraded and falls back to think."""
@@ -2366,7 +2399,8 @@ def create_app(
         client = _browser.get("client")
         if client is not None and hasattr(client, "_pool_size"):
             client._pool_size = value
-        log.info("Runtime pool_size set to %d (mode: %s)", value,
+        _persist_env("DOUBAO_POOL_SIZE", str(value))
+        log.info("Runtime pool_size set to %d (mode: %s), persisted to .env", value,
                  "single-page rotation" if value == 1 else "parallel contexts")
         return JSONResponse({"status": "ok", "pool_size": value})
 

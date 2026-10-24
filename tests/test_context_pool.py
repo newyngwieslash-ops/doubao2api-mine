@@ -817,3 +817,27 @@ def test_acquire_is_single_flight_per_account():
     p1, p2 = asyncio.run(scenario())
     assert len(created) == 1, f"expected 1 context, got {len(created)} (leak)"
     assert p1 is p2
+
+
+def test_pool_size_persists_to_env_file(tmp_path, monkeypatch):
+    """A UI change must survive a restart: the endpoint writes the key back to
+    .env (rewriting that line only, preserving comments and other keys)."""
+    import os
+    import doubao2api.unified_server as us
+
+    env = tmp_path / ".env"
+    env.write_text("# comment stays\nDOUBAO_PORT=9090\nDOUBAO_POOL_SIZE=1\nOTHER=keep\n", encoding="utf-8")
+    monkeypatch.setattr(us, "__file__", str(tmp_path / "pkg" / "unified_server.py"))
+    (tmp_path / "pkg").mkdir(exist_ok=True)
+
+    us._persist_env("DOUBAO_POOL_SIZE", "3")
+    text = env.read_text(encoding="utf-8")
+    assert "DOUBAO_POOL_SIZE=3" in text
+    assert "# comment stays" in text          # comments preserved
+    assert "DOUBAO_PORT=9090" in text         # other keys preserved
+    assert "OTHER=keep" in text
+
+    # absent key is appended
+    us._persist_env("DOUBAO_POOL_SIZE", "2")
+    assert "DOUBAO_POOL_SIZE=2" in env.read_text(encoding="utf-8")
+    assert env.read_text(encoding="utf-8").count("DOUBAO_POOL_SIZE") == 1
